@@ -1,8 +1,9 @@
 package com.animenexus
 
+import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Element
+import com.lagradost.cloudstream3.utils.AppUtils.parseJson
 
 class AnimeNexusProvider : MainAPI() {
     override var mainUrl = "https://anime-nexus.io"
@@ -11,38 +12,86 @@ class AnimeNexusProvider : MainAPI() {
     override var lang = "ro"
     override val supportedTypes = setOf(TvType.Anime)
 
-    override val mainPage = mainPageOf(
-        "$mainUrl/nexus/portal-serii/anime" to "Anime-uri AnimeNexus"
+    private var cachedSeries: List<NexusSeries>? = null
+
+    data class NexusResponse(
+        @JsonProperty("message") val message: String? = null,
+        @JsonProperty("response") val response: List<NexusSeries>? = null
     )
 
-    private fun Element.toSearchResult(): SearchResponse? {
-        val linkEl = this.selectFirst("div.chart-series-name a") ?: return null
-        val title = linkEl.text().trim()
-        val href = fixUrl(linkEl.attr("href"))
-        val posterUrl = fixUrlNull(
-            this.selectFirst("div.chart-picture")?.attr("data-picture")
-                ?.ifBlank { this.selectFirst("div.chart-picture img")?.attr("src") }
+    data class NexusSeries(
+        @JsonProperty("name") val name: String? = null,
+        @JsonProperty("link") val link: String? = null,
+        @JsonProperty("picture") val picture: String? = null,
+        @JsonProperty("date") val date: String? = null,
+        @JsonProperty("seen_amount") val seenAmount: String? = null,
+        @JsonProperty("series_rating") val seriesRating: Double? = null
+    )
+
+    override val mainPage = mainPageOf(
+        "newest" to "Cele mai noi",
+        "popular" to "Cele mai populare",
+        "top_rated" to "Cel mai bun scor",
+        "all" to "Toate Anime-urile (A-Z)"
+    )
+
+    private suspend fun getAllSeries(): List<NexusSeries> {
+        cachedSeries?.let { if (it.isNotEmpty()) return it }
+
+        val headers = mapOf(
+            "X-Requested-With" to "XMLHttpRequest",
+            "Referer" to "$mainUrl/nexus/portal-serii/anime"
         )
+        val responseText = app.post(
+            "$mainUrl/nexus/series_portal/full_data",
+            headers = headers
+        ).text
+
+        val parsed = parseJson<NexusResponse>(responseText)
+        val list = parsed.response ?: emptyList()
+        if (list.isNotEmpty()) {
+            cachedSeries = list
+        }
+        return list
+    }
+
+    private fun NexusSeries.toSearchResult(): SearchResponse? {
+        val rawName = this.name ?: return null
+        val slug = this.link ?: return null
+        val title = rawName.replace("✓", "").replace("🕒", "").trim()
+        val href = "$mainUrl/nexus/anime/$slug"
+        val poster = this.picture?.replace("http://", "https://")
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
-            this.posterUrl = posterUrl
+            this.posterUrl = poster
         }
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        if (page > 1) return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        val allSeries = getAllSeries()
+        val sorted = when (request.data) {
+            "newest" -> allSeries.sortedByDescending { it.date ?: "" }
+            "popular" -> allSeries.sortedByDescending { it.seenAmount?.toLongOrNull() ?: 0L }
+            "top_rated" -> allSeries.sortedByDescending { it.seriesRating ?: 0.0 }
+            else -> allSeries
+        }
 
-        val doc = app.get(request.data).document
-        val items = doc.select("table tbody tr").mapNotNull { it.toSearchResult() }
+        val pageSize = 40
+        val start = (page - 1) * pageSize
+        if (start >= sorted.size) {
+            return newHomePageResponse(request.name, emptyList(), hasNext = false)
+        }
 
-        return newHomePageResponse(request.name, items, hasNext = false)
+        val items = sorted.drop(start).take(pageSize).mapNotNull { it.toSearchResult() }
+        return newHomePageResponse(request.name, items, hasNext = start + pageSize < sorted.size)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val doc = app.get("$mainUrl/nexus/portal-serii/anime").document
-        return doc.select("table tbody tr")
+        val allSeries = getAllSeries()
+        return allSeries
+            .filter { it.name?.contains(query, ignoreCase = true) == true }
+            .take(50)
             .mapNotNull { it.toSearchResult() }
-            .filter { it.name.contains(query, ignoreCase = true) }
     }
 
     override suspend fun load(url: String): LoadResponse {
