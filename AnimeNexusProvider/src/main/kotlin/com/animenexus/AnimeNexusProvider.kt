@@ -1,9 +1,8 @@
 package com.animenexus
 
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import org.json.JSONObject
 
 class AnimeNexusProvider : MainAPI() {
     override var mainUrl = "https://anime-nexus.io"
@@ -14,18 +13,13 @@ class AnimeNexusProvider : MainAPI() {
 
     private var cachedSeries: List<NexusSeries>? = null
 
-    data class NexusResponse(
-        @JsonProperty("message") val message: String? = null,
-        @JsonProperty("response") val response: List<NexusSeries>? = null
-    )
-
     data class NexusSeries(
-        @JsonProperty("name") val name: String? = null,
-        @JsonProperty("link") val link: String? = null,
-        @JsonProperty("picture") val picture: String? = null,
-        @JsonProperty("date") val date: String? = null,
-        @JsonProperty("seen_amount") val seenAmount: String? = null,
-        @JsonProperty("series_rating") val seriesRating: Double? = null
+        val name: String,
+        val link: String,
+        val picture: String?,
+        val date: String,
+        val seenAmount: Long,
+        val seriesRating: Double
     )
 
     override val mainPage = mainPageOf(
@@ -47,19 +41,33 @@ class AnimeNexusProvider : MainAPI() {
             headers = headers
         ).text
 
-        val parsed = parseJson<NexusResponse>(responseText)
-        val list = parsed.response ?: emptyList()
+        val json = JSONObject(responseText)
+        val arr = json.optJSONArray("response") ?: return emptyList()
+        val list = mutableListOf<NexusSeries>()
+
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val name = obj.optString("name", "")
+            val link = obj.optString("link", "")
+            if (name.isBlank() || link.isBlank()) continue
+
+            val picture = obj.optString("picture", "").ifBlank { null }
+            val date = obj.optString("date", "")
+            val seenAmount = obj.optString("seen_amount", "0").toLongOrNull() ?: 0L
+            val seriesRating = obj.optDouble("series_rating", 0.0).let { if (it.isNaN()) 0.0 else it }
+
+            list.add(NexusSeries(name, link, picture, date, seenAmount, seriesRating))
+        }
+
         if (list.isNotEmpty()) {
             cachedSeries = list
         }
         return list
     }
 
-    private fun NexusSeries.toSearchResult(): SearchResponse? {
-        val rawName = this.name ?: return null
-        val slug = this.link ?: return null
-        val title = rawName.replace("✓", "").replace("🕒", "").trim()
-        val href = "$mainUrl/nexus/anime/$slug"
+    private fun NexusSeries.toSearchResult(): SearchResponse {
+        val title = this.name.replace("✓", "").replace("🕒", "").trim()
+        val href = "$mainUrl/nexus/anime/${this.link}"
         val poster = this.picture?.replace("http://", "https://")
 
         return newAnimeSearchResponse(title, href, TvType.Anime) {
@@ -70,9 +78,9 @@ class AnimeNexusProvider : MainAPI() {
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
         val allSeries = getAllSeries()
         val sorted = when (request.data) {
-            "newest" -> allSeries.sortedByDescending { it.date ?: "" }
-            "popular" -> allSeries.sortedByDescending { it.seenAmount?.toLongOrNull() ?: 0L }
-            "top_rated" -> allSeries.sortedByDescending { it.seriesRating ?: 0.0 }
+            "newest" -> allSeries.sortedByDescending { it.date }
+            "popular" -> allSeries.sortedByDescending { it.seenAmount }
+            "top_rated" -> allSeries.sortedByDescending { it.seriesRating }
             else -> allSeries
         }
 
@@ -82,16 +90,16 @@ class AnimeNexusProvider : MainAPI() {
             return newHomePageResponse(request.name, emptyList(), hasNext = false)
         }
 
-        val items = sorted.drop(start).take(pageSize).mapNotNull { it.toSearchResult() }
+        val items = sorted.drop(start).take(pageSize).map { it.toSearchResult() }
         return newHomePageResponse(request.name, items, hasNext = start + pageSize < sorted.size)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
         val allSeries = getAllSeries()
         return allSeries
-            .filter { it.name?.contains(query, ignoreCase = true) == true }
+            .filter { it.name.contains(query, ignoreCase = true) }
             .take(50)
-            .mapNotNull { it.toSearchResult() }
+            .map { it.toSearchResult() }
     }
 
     override suspend fun load(url: String): LoadResponse {
@@ -110,31 +118,4 @@ class AnimeNexusProvider : MainAPI() {
             val epText = el.text().trim()
             val epNum = epText.substringBefore(" -").trim().toIntOrNull() ?: (index + 1)
             newEpisode(epHref) {
-                this.name = epText
-                this.episode = epNum
-            }
-        }
-
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster
-            this.plot = plot
-            addEpisodes(DubStatus.Subbed, episodes)
-        }
-    }
-
-    override suspend fun loadLinks(
-        data: String,
-        isCasting: Boolean,
-        subtitleCallback: (SubtitleFile) -> Unit,
-        callback: (ExtractorLink) -> Unit
-    ): Boolean {
-        val doc = app.get(data).document
-        doc.select("iframe").forEach { iframe ->
-            val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
-            if (src.isNotBlank()) {
-                loadExtractor(fixUrl(src), data, subtitleCallback, callback)
-            }
-        }
-        return true
-    }
-}
+                this.name =
