@@ -118,4 +118,31 @@ class AnimeNexusProvider : MainAPI() {
             val epText = el.text().trim()
             val epNum = epText.substringBefore(" -").trim().toIntOrNull() ?: (index + 1)
             newEpisode(epHref) {
-                this.name =
+                this.name = epText
+                this.episode = epNum
+            }
+        }
+
+        return newAnimeLoadResponse(title, url, TvType.Anime) {
+            this.posterUrl = poster
+            this.plot = plot
+            addEpisodes(DubStatus.Subbed, episodes)
+        }
+    }
+
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val doc = app.get(data).document
+        doc.select("iframe").forEach { iframe ->
+            val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
+            if (src.isNotBlank()) {
+                loadExtractor(fixUrl(src), data, subtitleCallback, callback)
+            }
+        }
+        return true
+    }
+}
