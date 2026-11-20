@@ -1,0 +1,8 @@
+{
+    "name": "AnimeNexus Repo",
+    "description": "Extensia AnimeNexus (RO)",
+    "manifestVersion": 1,
+    "pluginLists": [
+        "https://raw.githubusercontent.com/Andy2k23/AnimeNexus/builds/plugins.json"
+    ]
+}
