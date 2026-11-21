@@ -2,6 +2,7 @@ package com.animenexus
 
 import android.content.SharedPreferences
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 
@@ -184,45 +185,23 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
         }
     }
 
-    private suspend fun extractPackedM3u8(
+    private suspend fun extractViaWebView(
         embedUrl: String,
         sourceName: String,
         callback: (ExtractorLink) -> Unit
     ) {
-        val m3u8Regex = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""")
-
-        val firstRes = app.get(embedUrl, referer = "$mainUrl/")
-        var pageHtml = firstRes.text
-        var activeUrl = firstRes.url
-
-        // FileMoon pune deseori player-ul real intr-un al doilea iframe din pagina
-        if (!pageHtml.contains("eval(function(p,a,c,k,e,d)") && !m3u8Regex.containsMatchIn(pageHtml)) {
-            val innerIframe = firstRes.document.selectFirst("iframe")?.attr("src")?.trim()
-            if (!innerIframe.isNullOrBlank()) {
-                val resolvedInner = if (innerIframe.startsWith("http")) innerIframe else fixUrl(innerIframe)
-                val secondRes = app.get(resolvedInner, referer = activeUrl)
-                pageHtml = secondRes.text
-                activeUrl = secondRes.url
-            }
-        }
-
-        val unpacked = try {
-            getAndUnpack(pageHtml)
-        } catch (_: Exception) {
-            ""
-        }
-
-        val combined = "$pageHtml\n$unpacked"
-        val m3u8Links = m3u8Regex.findAll(combined)
-            .map { it.value.replace("\\/", "/") }
-            .distinct()
-            .toList()
-
-        m3u8Links.forEach { m3u8Url ->
+        val resolver = WebViewResolver(
+            interceptUrl = Regex("""\.m3u8"""),
+            timeout = 15_000L
+        )
+        val res = app.get(embedUrl, referer = "$mainUrl/", interceptor = resolver)
+        val m3u8Url = res.url
+        if (m3u8Url.contains(".m3u8", ignoreCase = true)) {
+            val reqReferer = res.okhttpResponse.request.header("Referer") ?: embedUrl
             M3u8Helper.generateM3u8(
                 source = sourceName,
                 streamUrl = m3u8Url,
-                referer = activeUrl
+                referer = reqReferer
             ).forEach(callback)
         }
     }
@@ -250,16 +229,21 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             } catch (_: Exception) {
             }
 
-            if (!foundByBuiltIn) {
+            if (!foundByBuiltIn && (
+                    url.contains("bysedikamoum", true) ||
+                    url.contains("filemoon", true) ||
+                    url.contains("vidhide", true) ||
+                    url.contains("cybervynx", true)
+                )
+            ) {
                 try {
                     val hostLabel = when {
                         url.contains("bysedikamoum", true) || url.contains("filemoon", true) -> "FileMoon"
                         url.contains("vidhide", true) -> "VidHide"
-                        url.contains("cybervynx", true) || url.contains("streamhg", true) -> "StreamHG"
-                        url.contains("lulu", true) -> "LuluStream"
+                        url.contains("cybervynx", true) -> "StreamHG"
                         else -> "AnimeNexus"
                     }
-                    extractPackedM3u8(url, hostLabel, callback)
+                    extractViaWebView(url, hostLabel, callback)
                 } catch (_: Exception) {
                 }
             }
