@@ -184,21 +184,47 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
         }
     }
 
-    private fun expandMirrorUrls(url: String): List<String> {
-        val urls = mutableListOf(url)
-        val mirrorMap = mapOf(
-            "bysedikamoum.com" to "filemoon.sx",
-            "vide0.net" to "dood.li",
-            "cybervynx.com" to "streamwish.to",
-            "vidhidevip.com" to "vidhidepro.com",
-            "lulu.st" to "luluvdo.com"
-        )
-        for ((mirror, canonical) in mirrorMap) {
-            if (url.contains(mirror, ignoreCase = true)) {
-                urls.add(url.replace(mirror, canonical, ignoreCase = true))
+    private suspend fun extractPackedM3u8(
+        embedUrl: String,
+        sourceName: String,
+        callback: (ExtractorLink) -> Unit
+    ) {
+        val m3u8Regex = Regex("""https?://[^\s"'\\]+\.m3u8[^\s"'\\]*""")
+
+        val firstRes = app.get(embedUrl, referer = "$mainUrl/")
+        var pageHtml = firstRes.text
+        var activeUrl = firstRes.url
+
+        // FileMoon pune deseori player-ul real intr-un al doilea iframe din pagina
+        if (!pageHtml.contains("eval(function(p,a,c,k,e,d)") && !m3u8Regex.containsMatchIn(pageHtml)) {
+            val innerIframe = firstRes.document.selectFirst("iframe")?.attr("src")?.trim()
+            if (!innerIframe.isNullOrBlank()) {
+                val resolvedInner = if (innerIframe.startsWith("http")) innerIframe else fixUrl(innerIframe)
+                val secondRes = app.get(resolvedInner, referer = activeUrl)
+                pageHtml = secondRes.text
+                activeUrl = secondRes.url
             }
         }
-        return urls
+
+        val unpacked = try {
+            getAndUnpack(pageHtml)
+        } catch (_: Exception) {
+            ""
+        }
+
+        val combined = "$pageHtml\n$unpacked"
+        val m3u8Links = m3u8Regex.findAll(combined)
+            .map { it.value.replace("\\/", "/") }
+            .distinct()
+            .toList()
+
+        m3u8Links.forEach { m3u8Url ->
+            M3u8Helper.generateM3u8(
+                source = sourceName,
+                streamUrl = m3u8Url,
+                referer = activeUrl
+            ).forEach(callback)
+        }
     }
 
     override suspend fun loadLinks(
@@ -215,13 +241,27 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
                 val raw = iframe.attr("data-src").ifBlank { iframe.attr("src") }.trim()
                 if (raw.isNotBlank()) fixUrl(raw) else null
             }
-            .flatMap { expandMirrorUrls(it) }
             .distinct()
 
         iframeUrls.amap { url ->
+            var foundByBuiltIn = false
             try {
-                loadExtractor(url, "$mainUrl/", subtitleCallback, callback)
+                foundByBuiltIn = loadExtractor(url, "$mainUrl/", subtitleCallback, callback)
             } catch (_: Exception) {
+            }
+
+            if (!foundByBuiltIn) {
+                try {
+                    val hostLabel = when {
+                        url.contains("bysedikamoum", true) || url.contains("filemoon", true) -> "FileMoon"
+                        url.contains("vidhide", true) -> "VidHide"
+                        url.contains("cybervynx", true) || url.contains("streamhg", true) -> "StreamHG"
+                        url.contains("lulu", true) -> "LuluStream"
+                        else -> "AnimeNexus"
+                    }
+                    extractPackedM3u8(url, hostLabel, callback)
+                } catch (_: Exception) {
+                }
             }
         }
         return true
