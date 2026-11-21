@@ -192,10 +192,18 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     ): Boolean {
         val cookies = getSessionCookies()
         val doc = app.get(data, cookies = cookies).document
-        doc.select("iframe").forEach { iframe ->
-            val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
-            if (src.isNotBlank()) {
-                loadExtractor(fixUrl(src), data, subtitleCallback, callback)
+
+        val iframeUrls = doc.select("div.iframe_source iframe, iframe")
+            .mapNotNull { iframe ->
+                val raw = iframe.attr("data-src").ifBlank { iframe.attr("src") }.trim()
+                if (raw.isNotBlank()) fixUrl(raw) else null
+            }
+            .distinct()
+
+        iframeUrls.amap { url ->
+            try {
+                loadExtractor(url, "$mainUrl/", subtitleCallback, callback)
+            } catch (_: Exception) {
             }
         }
         return true
