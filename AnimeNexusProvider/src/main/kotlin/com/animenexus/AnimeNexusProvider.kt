@@ -80,6 +80,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
         )
         val responseText = app.post(
             "$mainUrl/nexus/series_portal/full_data",
+            data = mapOf("type" to "anime"),
             headers = headers,
             cookies = cookies
         ).text.trim()
