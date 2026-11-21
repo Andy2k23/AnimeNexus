@@ -57,8 +57,12 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
                 "loginPassword" to password,
                 "loginRememberme" to "on"
             ),
-            headers = mapOf("Referer" to "$mainUrl/"),
-            cookies = initCookies
+            headers = mapOf(
+                "Referer" to "$mainUrl/",
+                "X-Requested-With" to "XMLHttpRequest"
+            ),
+            cookies = initCookies,
+            allowRedirects = false
         )
 
         val merged = initCookies + loginRes.cookies
@@ -82,13 +86,17 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
         if (!responseText.startsWith("{")) {
             clearSession()
-            throw ErrorLoadingException("Autentificare eșuată! Verifică email-ul și parola în setările extensiei.")
+            throw ErrorLoadingException("Răspuns non-JSON: ${responseText.take(150)}")
         }
 
         val json = JSONObject(responseText)
-        val arr = json.optJSONArray("response") ?: return emptyList()
-        val list = mutableListOf<NexusSeries>()
+        val arr = json.optJSONArray("response")
+        if (arr == null || arr.length() == 0) {
+            clearSession()
+            throw ErrorLoadingException("JSON fără listă: ${responseText.take(200)}")
+        }
 
+        val list = mutableListOf<NexusSeries>()
         for (i in 0 until arr.length()) {
             val obj = arr.optJSONObject(i) ?: continue
             val name = obj.optString("name", "")
