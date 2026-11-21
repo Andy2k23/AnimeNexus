@@ -1,17 +1,26 @@
 package com.animenexus
 
+import android.content.SharedPreferences
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 
-class AnimeNexusProvider : MainAPI() {
+class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     override var mainUrl = "https://anime-nexus.io"
     override var name = "AnimeNexus"
     override val hasMainPage = true
     override var lang = "ro"
     override val supportedTypes = setOf(TvType.Anime)
 
-    private var cachedSeries: List<NexusSeries>? = null
+    companion object {
+        private var sessionCookies: Map<String, String> = emptyMap()
+        private var cachedSeries: List<NexusSeries>? = null
+
+        fun clearSession() {
+            sessionCookies = emptyMap()
+            cachedSeries = null
+        }
+    }
 
     data class NexusSeries(
         val name: String,
@@ -29,17 +38,52 @@ class AnimeNexusProvider : MainAPI() {
         "all" to "Toate Anime-urile (A-Z)"
     )
 
+    private suspend fun getSessionCookies(): Map<String, String> {
+        if (sessionCookies.isNotEmpty()) return sessionCookies
+
+        val username = prefs.getString("username", "")?.trim().orEmpty()
+        val password = prefs.getString("password", "").orEmpty()
+
+        if (username.isBlank() || password.isBlank()) {
+            throw ErrorLoadingException("Configurează contul din Settings -> Extensions -> AnimeNexus (rotița de setări).")
+        }
+
+        val initCookies = app.get("$mainUrl/").cookies
+        val loginRes = app.post(
+            "$mainUrl/nexus/login_account",
+            data = mapOf(
+                "referer" to "$mainUrl/",
+                "loginUsername" to username,
+                "loginPassword" to password,
+                "loginRememberme" to "on"
+            ),
+            headers = mapOf("Referer" to "$mainUrl/"),
+            cookies = initCookies
+        )
+
+        val merged = initCookies + loginRes.cookies
+        sessionCookies = merged
+        return merged
+    }
+
     private suspend fun getAllSeries(): List<NexusSeries> {
         cachedSeries?.let { if (it.isNotEmpty()) return it }
 
+        val cookies = getSessionCookies()
         val headers = mapOf(
             "X-Requested-With" to "XMLHttpRequest",
             "Referer" to "$mainUrl/nexus/portal-serii/anime"
         )
         val responseText = app.post(
             "$mainUrl/nexus/series_portal/full_data",
-            headers = headers
-        ).text
+            headers = headers,
+            cookies = cookies
+        ).text.trim()
+
+        if (!responseText.startsWith("{")) {
+            clearSession()
+            throw ErrorLoadingException("Autentificare eșuată! Verifică email-ul și parola în setările extensiei.")
+        }
 
         val json = JSONObject(responseText)
         val arr = json.optJSONArray("response") ?: return emptyList()
@@ -103,7 +147,8 @@ class AnimeNexusProvider : MainAPI() {
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val doc = app.get(url).document
+        val cookies = getSessionCookies()
+        val doc = app.get(url, cookies = cookies).document
         val title = doc.selectFirst("div.page-title h1")?.text()?.trim() ?: "Necunoscut"
         val poster = fixUrlNull(doc.selectFirst("img.series-frame-image")?.attr("src"))
         val plot = doc.select("div.row")
@@ -136,7 +181,8 @@ class AnimeNexusProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val doc = app.get(data).document
+        val cookies = getSessionCookies()
+        val doc = app.get(data, cookies = cookies).document
         doc.select("iframe").forEach { iframe ->
             val src = iframe.attr("src").ifBlank { iframe.attr("data-src") }
             if (src.isNotBlank()) {
