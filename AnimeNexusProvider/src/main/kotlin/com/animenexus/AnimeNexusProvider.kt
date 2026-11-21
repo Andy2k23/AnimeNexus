@@ -184,6 +184,23 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
         }
     }
 
+    private fun expandMirrorUrls(url: String): List<String> {
+        val urls = mutableListOf(url)
+        val mirrorMap = mapOf(
+            "bysedikamoum.com" to "filemoon.sx",
+            "vide0.net" to "dood.li",
+            "cybervynx.com" to "streamwish.to",
+            "vidhidevip.com" to "vidhidepro.com",
+            "lulu.st" to "luluvdo.com"
+        )
+        for ((mirror, canonical) in mirrorMap) {
+            if (url.contains(mirror, ignoreCase = true)) {
+                urls.add(url.replace(mirror, canonical, ignoreCase = true))
+            }
+        }
+        return urls
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -198,6 +215,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
                 val raw = iframe.attr("data-src").ifBlank { iframe.attr("src") }.trim()
                 if (raw.isNotBlank()) fixUrl(raw) else null
             }
+            .flatMap { expandMirrorUrls(it) }
             .distinct()
 
         iframeUrls.amap { url ->
