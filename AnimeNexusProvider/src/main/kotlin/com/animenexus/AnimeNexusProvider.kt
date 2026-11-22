@@ -2,9 +2,10 @@ package com.animenexus
 
 import android.content.SharedPreferences
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
+import org.jsoup.nodes.Document
+import org.jsoup.nodes.Element
 
 class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     override var mainUrl = "https://anime-nexus.io"
@@ -156,53 +157,120 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             .map { it.toSearchResult() }
     }
 
-    override suspend fun load(url: String): LoadResponse {
-        val cookies = getSessionCookies()
-        val doc = app.get(url, cookies = cookies).document
-        val title = doc.selectFirst("div.page-title h1")?.text()?.trim() ?: "Necunoscut"
-        val poster = fixUrlNull(doc.selectFirst("img.series-frame-image")?.attr("src"))
-        val plot = doc.select("div.row")
-            .firstOrNull { it.selectFirst("div.bold")?.text()?.contains("Descriere") == true }
-            ?.select("div")
-            ?.getOrNull(1)
-            ?.text()
-            ?.trim()
+    private fun findInfoValueElement(doc: Document, labelPrefix: String): Element? {
+        val labelEl = doc.select("div.bold, strong, b, dt").firstOrNull {
+            it.ownText().trim().startsWith(labelPrefix, ignoreCase = true) ||
+                it.text().trim().startsWith(labelPrefix, ignoreCase = true)
+        } ?: return null
 
-        val episodes = doc.select("div.episode-list a.btn.text-primary").mapIndexed { index, el ->
+        labelEl.nextElementSibling()?.let { return it }
+
+        val parentRow = labelEl.parent()
+        val children = parentRow?.children()
+        if (children != null && children.size >= 2) {
+            val idx = children.indexOf(labelEl)
+            if (idx in 0 until children.size - 1) {
+                return children[idx + 1]
+            }
+        }
+        return null
+    }
+
+    private fun parseEpisodes(doc: Document, seasonNumber: Int): List<Episode> {
+        return doc.select("div.episode-list a.btn.text-primary").mapIndexed { index, el ->
             val epHref = fixUrl(el.attr("href"))
             val epText = el.text().trim()
             val epNum = epText.substringBefore(" -").trim().toIntOrNull() ?: (index + 1)
             newEpisode(epHref) {
                 this.name = epText
+                this.season = seasonNumber
                 this.episode = epNum
+            }
+        }
+    }
+
+    override suspend fun load(url: String): LoadResponse {
+        val cookies = getSessionCookies()
+        val doc = app.get(url, cookies = cookies).document
+
+        val title = doc.selectFirst("div.page-title h1, h1")?.text()?.trim() ?: "Necunoscut"
+        val poster = fixUrlNull(doc.selectFirst("img.series-frame-image")?.attr("src"))
+
+        val plot = findInfoValueElement(doc, "Descriere")?.text()?.trim()
+
+        val genres = findInfoValueElement(doc, "Genuri")?.text()
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            .orEmpty()
+
+        val themes = findInfoValueElement(doc, "Teme")?.text()
+            ?.split(",")
+            ?.map { it.trim() }
+            ?.filter { it.isNotBlank() }
+            .orEmpty()
+
+        val tags = (genres + themes).distinct()
+
+        val year = findInfoValueElement(doc, "Data lans")?.text()
+            ?.let { Regex("""\b(19\d{2}|20\d{2})\b""").find(it)?.value?.toIntOrNull() }
+
+        val duration = findInfoValueElement(doc, "Durat")?.text()
+            ?.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
+
+        val recommendations = findInfoValueElement(doc, "Serii alternative")
+            ?.select("a[href]")
+            ?.mapNotNull { a ->
+                val recTitle = a.text().trim()
+                val recHref = fixUrl(a.attr("href"))
+                if (recTitle.isNotBlank() && recHref.contains("/nexus/")) {
+                    newAnimeSearchResponse(recTitle, recHref, TvType.Anime)
+                } else {
+                    null
+                }
+            }
+            .orEmpty()
+
+        val allEpisodes = mutableListOf<Episode>()
+        allEpisodes.addAll(parseEpisodes(doc, seasonNumber = 1))
+
+        // Urmareste automat "Serie urmatoare" pentru a incarca Sezonul 2, 3 etc.
+        val visited = mutableSetOf(url.trimEnd('/'))
+        var currentDoc = doc
+        var seasonNum = 2
+
+        while (seasonNum <= 10) {
+            val nextHref = findInfoValueElement(currentDoc, "Serie urm")
+                ?.selectFirst("a[href]")
+                ?.attr("href")
+                ?.let { fixUrl(it) }
+                ?: break
+
+            val normalized = nextHref.trimEnd('/')
+            if (normalized in visited) break
+            visited.add(normalized)
+
+            try {
+                val nextDoc = app.get(nextHref, cookies = cookies).document
+                val nextEps = parseEpisodes(nextDoc, seasonNumber = seasonNum)
+                if (nextEps.isNotEmpty()) {
+                    allEpisodes.addAll(nextEps)
+                    seasonNum++
+                }
+                currentDoc = nextDoc
+            } catch (_: Exception) {
+                break
             }
         }
 
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
             this.plot = plot
-            addEpisodes(DubStatus.Subbed, episodes)
-        }
-    }
-
-    private suspend fun extractViaWebView(
-        embedUrl: String,
-        sourceName: String,
-        callback: (ExtractorLink) -> Unit
-    ) {
-        val resolver = WebViewResolver(
-            interceptUrl = Regex("""\.m3u8"""),
-            timeout = 15_000L
-        )
-        val res = app.get(embedUrl, referer = "$mainUrl/", interceptor = resolver)
-        val m3u8Url = res.url
-        if (m3u8Url.contains(".m3u8", ignoreCase = true)) {
-            val reqReferer = res.okhttpResponse.request.header("Referer") ?: embedUrl
-            M3u8Helper.generateM3u8(
-                source = sourceName,
-                streamUrl = m3u8Url,
-                referer = reqReferer
-            ).forEach(callback)
+            this.tags = tags
+            this.year = year
+            this.duration = duration
+            this.recommendations = recommendations
+            addEpisodes(DubStatus.Subbed, allEpisodes)
         }
     }
 
@@ -223,29 +291,9 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             .distinct()
 
         iframeUrls.amap { url ->
-            var foundByBuiltIn = false
             try {
-                foundByBuiltIn = loadExtractor(url, "$mainUrl/", subtitleCallback, callback)
+                loadExtractor(url, "$mainUrl/", subtitleCallback, callback)
             } catch (_: Exception) {
-            }
-
-            if (!foundByBuiltIn && (
-                    url.contains("bysedikamoum", true) ||
-                    url.contains("filemoon", true) ||
-                    url.contains("vidhide", true) ||
-                    url.contains("cybervynx", true)
-                )
-            ) {
-                try {
-                    val hostLabel = when {
-                        url.contains("bysedikamoum", true) || url.contains("filemoon", true) -> "FileMoon"
-                        url.contains("vidhide", true) -> "VidHide"
-                        url.contains("cybervynx", true) -> "StreamHG"
-                        else -> "AnimeNexus"
-                    }
-                    extractViaWebView(url, hostLabel, callback)
-                } catch (_: Exception) {
-                }
             }
         }
         return true
