@@ -7,6 +7,7 @@ import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.util.concurrent.ConcurrentHashMap
 
 class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     override var mainUrl = "https://anime-nexus.io"
@@ -18,10 +19,12 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     companion object {
         private var sessionCookies: Map<String, String> = emptyMap()
         private var cachedSeries: List<NexusSeries>? = null
+        private val cachedDocs = ConcurrentHashMap<String, Document>()
 
         fun clearSession() {
             sessionCookies = emptyMap()
             cachedSeries = null
+            cachedDocs.clear()
         }
     }
 
@@ -71,6 +74,14 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
         val merged = initCookies + loginRes.cookies
         sessionCookies = merged
         return merged
+    }
+
+    private suspend fun getSeriesDoc(url: String, cookies: Map<String, String>): Document {
+        val key = url.trimEnd('/')
+        cachedDocs[key]?.let { return it }
+        val doc = app.get(url, cookies = cookies).document
+        cachedDocs[key] = doc
+        return doc
     }
 
     private suspend fun getAllSeries(): List<NexusSeries> {
@@ -191,8 +202,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
     private fun parseEpisodes(
         doc: Document,
-        seasonNumber: Int,
-        fallbackPoster: String?
+        seasonNumber: Int
     ): List<Episode> {
         return doc.select("div.episode-list a.btn.text-primary").mapIndexed { index, el ->
             val epHref = fixUrl(el.attr("href"))
@@ -202,28 +212,50 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
                 this.name = epText
                 this.season = seasonNumber
                 this.episode = epNum
-                this.posterUrl = fallbackPoster
             }
         }
     }
 
     override suspend fun load(url: String): LoadResponse {
         val cookies = getSessionCookies()
-        val doc = app.get(url, cookies = cookies).document
+        val initialDoc = getSeriesDoc(url, cookies)
 
-        val title = doc.selectFirst("div.page-title h1, h1")?.text()?.trim() ?: "Necunoscut"
-        val poster = fixUrlNull(doc.selectFirst("img.series-frame-image")?.attr("src"))
-        val malId = extractMalId(doc)
+        // Merge inapoi pe "Serie anterioara" / "Serie precedenta" pana la Sezonul 1 real
+        var firstUrl = url
+        var firstDoc = initialDoc
+        val visitedBack = mutableSetOf(url.trimEnd('/'))
+        var stepsBack = 0
 
-        val plot = findInfoValueElement(doc, "Descriere")?.text()?.trim()
+        while (stepsBack < 10) {
+            val prevEl = findInfoValueElement(firstDoc, "Serie anterioar")
+                ?: findInfoValueElement(firstDoc, "Serie precedent")
+            val prevHref = prevEl?.selectFirst("a[href]")?.attr("href")?.let { fixUrl(it) } ?: break
+            val normalized = prevHref.trimEnd('/')
+            if (normalized in visitedBack) break
+            visitedBack.add(normalized)
 
-        val genres = findInfoValueElement(doc, "Genuri")?.text()
+            try {
+                firstDoc = getSeriesDoc(prevHref, cookies)
+                firstUrl = prevHref
+                stepsBack++
+            } catch (_: Exception) {
+                break
+            }
+        }
+
+        val title = firstDoc.selectFirst("div.page-title h1, h1")?.text()?.trim() ?: "Necunoscut"
+        val poster = fixUrlNull(firstDoc.selectFirst("img.series-frame-image")?.attr("src"))
+        val malId = extractMalId(firstDoc)
+
+        val plot = findInfoValueElement(firstDoc, "Descriere")?.text()?.trim()
+
+        val genres = findInfoValueElement(firstDoc, "Genuri")?.text()
             ?.split(",")
             ?.map { it.trim() }
             ?.filter { it.isNotBlank() }
             .orEmpty()
 
-        val themes = findInfoValueElement(doc, "Teme")?.text()
+        val themes = findInfoValueElement(firstDoc, "Teme")?.text()
             ?.split(",")
             ?.map { it.trim() }
             ?.filter { it.isNotBlank() }
@@ -231,13 +263,13 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
         val tags = (genres + themes).distinct()
 
-        val year = findInfoValueElement(doc, "Data lans")?.text()
+        val year = findInfoValueElement(firstDoc, "Data lans")?.text()
             ?.let { Regex("""\b(19\d{2}|20\d{2})\b""").find(it)?.value?.toIntOrNull() }
 
-        val duration = findInfoValueElement(doc, "Durat")?.text()
+        val duration = findInfoValueElement(firstDoc, "Durat")?.text()
             ?.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
 
-        val recommendations = findInfoValueElement(doc, "Serii alternative")
+        val recommendations = findInfoValueElement(firstDoc, "Serii alternative")
             ?.select("a[href]")
             ?.mapNotNull { a ->
                 val recTitle = a.text().trim()
@@ -250,12 +282,12 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             }
             .orEmpty()
 
+        // Parcurge inainte de la Sezonul 1 real -> Sezonul 2, 3, 4...
         val allEpisodes = mutableListOf<Episode>()
-        allEpisodes.addAll(parseEpisodes(doc, seasonNumber = 1, fallbackPoster = poster))
+        allEpisodes.addAll(parseEpisodes(firstDoc, seasonNumber = 1))
 
-        // Urmareste automat "Serie urmatoare" pentru a incarca Sezonul 2, 3 etc.
-        val visited = mutableSetOf(url.trimEnd('/'))
-        var currentDoc = doc
+        val visitedForward = mutableSetOf(firstUrl.trimEnd('/'))
+        var currentDoc = firstDoc
         var seasonNum = 2
 
         while (seasonNum <= 10) {
@@ -266,13 +298,12 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
                 ?: break
 
             val normalized = nextHref.trimEnd('/')
-            if (normalized in visited) break
-            visited.add(normalized)
+            if (normalized in visitedForward) break
+            visitedForward.add(normalized)
 
             try {
-                val nextDoc = app.get(nextHref, cookies = cookies).document
-                val nextPoster = fixUrlNull(nextDoc.selectFirst("img.series-frame-image")?.attr("src")) ?: poster
-                val nextEps = parseEpisodes(nextDoc, seasonNumber = seasonNum, fallbackPoster = nextPoster)
+                val nextDoc = getSeriesDoc(nextHref, cookies)
+                val nextEps = parseEpisodes(nextDoc, seasonNumber = seasonNum)
                 if (nextEps.isNotEmpty()) {
                     allEpisodes.addAll(nextEps)
                     seasonNum++
