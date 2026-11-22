@@ -69,6 +69,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
                     "loginRememberme" to "on"
                 ),
                 headers = mapOf(
+                    "Origin" to mainUrl,
                     "Referer" to "$mainUrl/",
                     "X-Requested-With" to "XMLHttpRequest"
                 ),
@@ -76,7 +77,16 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
                 allowRedirects = false
             )
 
-            val merged = initCookies + loginRes.cookies
+            var merged = initCookies + loginRes.cookies
+
+            // Viziteaza pagina portalului pentru a finaliza sesiunea inainte de cererea JSON
+            val portalRes = app.get(
+                "$mainUrl/nexus/portal-serii/anime",
+                headers = mapOf("Referer" to "$mainUrl/"),
+                cookies = merged
+            )
+            merged = merged + portalRes.cookies
+
             sessionCookies = merged
             return merged
         } finally {
@@ -94,6 +104,8 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
     private suspend fun fetchSeriesJson(cookies: Map<String, String>): String {
         val headers = mapOf(
+            "Origin" to mainUrl,
+            "Accept" to "application/json, text/javascript, */*; q=0.01",
             "X-Requested-With" to "XMLHttpRequest",
             "Referer" to "$mainUrl/nexus/portal-serii/anime"
         )
@@ -112,13 +124,12 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
         try {
             cachedSeries?.let { if (it.isNotEmpty()) return it }
 
-            var cookies = getSessionCookies()
-            var responseText = fetchSeriesJson(cookies)
-
-            // Daca sesiunea a expirat, incearca automat o relogare curata
-            if (!responseText.startsWith("{")) {
-                cookies = getSessionCookies(forceRefresh = true)
+            var responseText = ""
+            for (attempt in 1..3) {
+                val cookies = getSessionCookies(forceRefresh = attempt > 1)
                 responseText = fetchSeriesJson(cookies)
+                if (responseText.startsWith("{")) break
+                Thread.sleep(700)
             }
 
             if (!responseText.startsWith("{")) {
