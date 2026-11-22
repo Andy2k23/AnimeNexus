@@ -47,10 +47,41 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
         "all" to "Toate Anime-urile (A-Z)"
     )
 
+    private fun loadSavedCookies(): Map<String, String> {
+        val raw = prefs.getString("saved_cookies", null) ?: return emptyMap()
+        return try {
+            val json = JSONObject(raw)
+            val map = mutableMapOf<String, String>()
+            val keys = json.keys()
+            while (keys.hasNext()) {
+                val k = keys.next()
+                val v = json.optString(k, "")
+                if (v.isNotBlank() && v != "deleted") {
+                    map[k] = v
+                }
+            }
+            map
+        } catch (_: Exception) {
+            emptyMap()
+        }
+    }
+
+    private fun saveCookies(cookies: Map<String, String>) {
+        val clean = cookies.filterValues { it.isNotBlank() && it != "deleted" }
+        prefs.edit().putString("saved_cookies", JSONObject(clean).toString()).apply()
+    }
+
     private suspend fun getSessionCookies(forceRefresh: Boolean = false): Map<String, String> {
         sessionLock.acquire()
         try {
-            if (!forceRefresh && sessionCookies.isNotEmpty()) return sessionCookies
+            if (!forceRefresh) {
+                if (sessionCookies.isNotEmpty()) return sessionCookies
+                val saved = loadSavedCookies()
+                if (saved.isNotEmpty()) {
+                    sessionCookies = saved
+                    return saved
+                }
+            }
 
             val username = prefs.getString("username", "")?.trim().orEmpty()
             val password = prefs.getString("password", "").orEmpty()
@@ -77,18 +108,21 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
                 allowRedirects = false
             )
 
-            var merged = initCookies + loginRes.cookies
+            val merged = (initCookies + loginRes.cookies)
+                .filterValues { it.isNotBlank() && it != "deleted" }
 
-            // Viziteaza pagina portalului pentru a finaliza sesiunea inainte de cererea JSON
             val portalRes = app.get(
                 "$mainUrl/nexus/portal-serii/anime",
                 headers = mapOf("Referer" to "$mainUrl/"),
                 cookies = merged
             )
-            merged = merged + portalRes.cookies
 
-            sessionCookies = merged
-            return merged
+            val finalCookies = (merged + portalRes.cookies)
+                .filterValues { it.isNotBlank() && it != "deleted" }
+
+            sessionCookies = finalCookies
+            saveCookies(finalCookies)
+            return finalCookies
         } finally {
             sessionLock.release()
         }
@@ -134,6 +168,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
             if (!responseText.startsWith("{")) {
                 clearSession()
+                prefs.edit().remove("saved_cookies").apply()
                 throw ErrorLoadingException("Răspuns non-JSON: ${responseText.take(150)}")
             }
 
@@ -141,6 +176,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             val arr = json.optJSONArray("response")
             if (arr == null || arr.length() == 0) {
                 clearSession()
+                prefs.edit().remove("saved_cookies").apply()
                 throw ErrorLoadingException("JSON fără listă: ${responseText.take(200)}")
             }
 
