@@ -2,6 +2,7 @@ package com.animenexus
 
 import android.content.SharedPreferences
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 import org.jsoup.nodes.Document
@@ -176,7 +177,23 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
         return null
     }
 
-    private fun parseEpisodes(doc: Document, seasonNumber: Int): List<Episode> {
+    private fun extractMalId(doc: Document): Int? {
+        val malHref = doc.selectFirst("a[href*=myanimelist.net/anime/]")?.attr("href")
+            ?: findInfoValueElement(doc, "Link extern")?.text()
+            ?: return null
+
+        return Regex("""myanimelist\.net/anime/(\d+)""")
+            .find(malHref)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?.toIntOrNull()
+    }
+
+    private fun parseEpisodes(
+        doc: Document,
+        seasonNumber: Int,
+        fallbackPoster: String?
+    ): List<Episode> {
         return doc.select("div.episode-list a.btn.text-primary").mapIndexed { index, el ->
             val epHref = fixUrl(el.attr("href"))
             val epText = el.text().trim()
@@ -185,6 +202,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
                 this.name = epText
                 this.season = seasonNumber
                 this.episode = epNum
+                this.posterUrl = fallbackPoster
             }
         }
     }
@@ -195,6 +213,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
         val title = doc.selectFirst("div.page-title h1, h1")?.text()?.trim() ?: "Necunoscut"
         val poster = fixUrlNull(doc.selectFirst("img.series-frame-image")?.attr("src"))
+        val malId = extractMalId(doc)
 
         val plot = findInfoValueElement(doc, "Descriere")?.text()?.trim()
 
@@ -232,7 +251,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             .orEmpty()
 
         val allEpisodes = mutableListOf<Episode>()
-        allEpisodes.addAll(parseEpisodes(doc, seasonNumber = 1))
+        allEpisodes.addAll(parseEpisodes(doc, seasonNumber = 1, fallbackPoster = poster))
 
         // Urmareste automat "Serie urmatoare" pentru a incarca Sezonul 2, 3 etc.
         val visited = mutableSetOf(url.trimEnd('/'))
@@ -252,7 +271,8 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
             try {
                 val nextDoc = app.get(nextHref, cookies = cookies).document
-                val nextEps = parseEpisodes(nextDoc, seasonNumber = seasonNum)
+                val nextPoster = fixUrlNull(nextDoc.selectFirst("img.series-frame-image")?.attr("src")) ?: poster
+                val nextEps = parseEpisodes(nextDoc, seasonNumber = seasonNum, fallbackPoster = nextPoster)
                 if (nextEps.isNotEmpty()) {
                     allEpisodes.addAll(nextEps)
                     seasonNum++
@@ -270,6 +290,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             this.year = year
             this.duration = duration
             this.recommendations = recommendations
+            addMalId(malId)
             addEpisodes(DubStatus.Subbed, allEpisodes)
         }
     }
