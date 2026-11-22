@@ -4,12 +4,11 @@ import android.content.SharedPreferences
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Semaphore
 
 class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     override var mainUrl = "https://anime-nexus.io"
@@ -19,8 +18,8 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime)
 
     companion object {
-        private val sessionMutex = Mutex()
-        private val seriesMutex = Mutex()
+        private val sessionLock = Semaphore(1)
+        private val seriesLock = Semaphore(1)
         private var sessionCookies: Map<String, String> = emptyMap()
         private var cachedSeries: List<NexusSeries>? = null
         private val cachedDocs = ConcurrentHashMap<String, Document>()
@@ -49,8 +48,9 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     )
 
     private suspend fun getSessionCookies(forceRefresh: Boolean = false): Map<String, String> {
-        return sessionMutex.withLock {
-            if (!forceRefresh && sessionCookies.isNotEmpty()) return@withLock sessionCookies
+        sessionLock.acquire()
+        try {
+            if (!forceRefresh && sessionCookies.isNotEmpty()) return sessionCookies
 
             val username = prefs.getString("username", "")?.trim().orEmpty()
             val password = prefs.getString("password", "").orEmpty()
@@ -78,7 +78,9 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
             val merged = initCookies + loginRes.cookies
             sessionCookies = merged
-            merged
+            return merged
+        } finally {
+            sessionLock.release()
         }
     }
 
@@ -106,8 +108,9 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     private suspend fun getAllSeries(): List<NexusSeries> {
         cachedSeries?.let { if (it.isNotEmpty()) return it }
 
-        return seriesMutex.withLock {
-            cachedSeries?.let { if (it.isNotEmpty()) return@withLock it }
+        seriesLock.acquire()
+        try {
+            cachedSeries?.let { if (it.isNotEmpty()) return it }
 
             var cookies = getSessionCookies()
             var responseText = fetchSeriesJson(cookies)
@@ -148,7 +151,9 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             if (list.isNotEmpty()) {
                 cachedSeries = list
             }
-            list
+            return list
+        } finally {
+            seriesLock.release()
         }
     }
 
