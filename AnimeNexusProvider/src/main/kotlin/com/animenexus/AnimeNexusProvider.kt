@@ -4,6 +4,9 @@ import android.content.SharedPreferences
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.utils.*
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -13,7 +16,6 @@ import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
-import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 
 class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
@@ -24,8 +26,8 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime)
 
     companion object {
-        private val sessionLock = Semaphore(1)
-        private val seriesLock = Semaphore(1)
+        private val sessionMutex = Mutex()
+        private val seriesMutex = Mutex()
         private val watchScheduler = Executors.newSingleThreadScheduledExecutor()
         private var pendingWatchTask: ScheduledFuture<*>? = null
 
@@ -82,14 +84,13 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     }
 
     private suspend fun getSessionCookies(forceRefresh: Boolean = false): Map<String, String> {
-        sessionLock.acquire()
-        try {
+        return sessionMutex.withLock {
             if (!forceRefresh) {
-                if (sessionCookies.isNotEmpty()) return sessionCookies
+                if (sessionCookies.isNotEmpty()) return@withLock sessionCookies
                 val saved = loadSavedCookies()
                 if (saved.isNotEmpty()) {
                     sessionCookies = saved
-                    return saved
+                    return@withLock saved
                 }
             }
 
@@ -132,9 +133,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
             sessionCookies = finalCookies
             saveCookies(finalCookies)
-            return finalCookies
-        } finally {
-            sessionLock.release()
+            finalCookies
         }
     }
 
@@ -164,16 +163,15 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     private suspend fun getAllSeries(): List<NexusSeries> {
         cachedSeries?.let { if (it.isNotEmpty()) return it }
 
-        seriesLock.acquire()
-        try {
-            cachedSeries?.let { if (it.isNotEmpty()) return it }
+        return seriesMutex.withLock {
+            cachedSeries?.let { if (it.isNotEmpty()) return@withLock it }
 
             var responseText = ""
             for (attempt in 1..3) {
                 val cookies = getSessionCookies(forceRefresh = attempt > 1)
                 responseText = fetchSeriesJson(cookies)
                 if (responseText.startsWith("{")) break
-                Thread.sleep(700)
+                delay(700)
             }
 
             if (!responseText.startsWith("{")) {
@@ -208,9 +206,7 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             if (list.isNotEmpty()) {
                 cachedSeries = list
             }
-            return list
-        } finally {
-            seriesLock.release()
+            list
         }
     }
 
