@@ -7,8 +7,14 @@ import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.net.HttpURLConnection
+import java.net.URL
+import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.Semaphore
+import java.util.concurrent.TimeUnit
 
 class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     override var mainUrl = "https://anime-nexus.io"
@@ -20,9 +26,13 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     companion object {
         private val sessionLock = Semaphore(1)
         private val seriesLock = Semaphore(1)
+        private val watchScheduler = Executors.newSingleThreadScheduledExecutor()
+        private var pendingWatchTask: ScheduledFuture<*>? = null
+
         private var sessionCookies: Map<String, String> = emptyMap()
         private var cachedSeries: List<NexusSeries>? = null
         private val cachedDocs = ConcurrentHashMap<String, Document>()
+        private val cachedJikanFlags = ConcurrentHashMap<Int, Pair<Set<Int>, Set<Int>>>()
 
         fun clearSession() {
             sessionCookies = emptyMap()
@@ -272,16 +282,68 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             ?.toIntOrNull()
     }
 
+    private suspend fun getJikanEpisodeFlags(malId: Int?): Pair<Set<Int>, Set<Int>> {
+        if (malId == null) return emptySet<Int>() to emptySet()
+        cachedJikanFlags[malId]?.let { return it }
+
+        val fillers = mutableSetOf<Int>()
+        val recaps = mutableSetOf<Int>()
+
+        try {
+            var page = 1
+            while (page <= 15) {
+                val resText = app.get("https://api.jikan.moe/v4/anime/$malId/episodes?page=$page").text
+                if (!resText.startsWith("{")) break
+
+                val json = JSONObject(resText)
+                val data = json.optJSONArray("data") ?: break
+                for (i in 0 until data.length()) {
+                    val ep = data.optJSONObject(i) ?: continue
+                    val num = ep.optInt("mal_id", -1)
+                    if (num <= 0) continue
+                    if (ep.optBoolean("filler", false)) fillers.add(num)
+                    if (ep.optBoolean("recap", false)) recaps.add(num)
+                }
+
+                val hasNext = json.optJSONObject("pagination")?.optBoolean("has_next_page", false) ?: false
+                if (!hasNext) break
+                page++
+            }
+        } catch (_: Exception) {
+        }
+
+        val result = fillers.toSet() to recaps.toSet()
+        cachedJikanFlags[malId] = result
+        return result
+    }
+
     private fun parseEpisodes(
         doc: Document,
-        seasonNumber: Int
+        seasonNumber: Int,
+        jikanFillers: Set<Int> = emptySet(),
+        jikanRecaps: Set<Int> = emptySet()
     ): List<Episode> {
         return doc.select("div.episode-list a.btn.text-primary").mapIndexed { index, el ->
             val epHref = fixUrl(el.attr("href"))
             val epText = el.text().trim()
             val epNum = epText.substringBefore(" -").trim().toIntOrNull() ?: (index + 1)
+
+            val rawHtml = el.outerHtml()
+            val isFiller = rawHtml.contains("filler", ignoreCase = true) || epNum in jikanFillers
+            val isRecap = rawHtml.contains("recap", ignoreCase = true) || epNum in jikanRecaps
+
+            val cleanName = epText
+                .replace(Regex("""^\s*\[(FILLER|RECAP)]\s*""", RegexOption.IGNORE_CASE), "")
+                .trim()
+
+            val prefix = when {
+                isFiller -> "[FILLER] "
+                isRecap -> "[RECAP] "
+                else -> ""
+            }
+
             newEpisode(epHref) {
-                this.name = epText
+                this.name = "$prefix$cleanName"
                 this.season = seasonNumber
                 this.episode = epNum
             }
@@ -356,7 +418,8 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
         // Parcurge inainte de la Sezonul 1 real -> Sezonul 2, 3, 4...
         val allEpisodes = mutableListOf<Episode>()
-        allEpisodes.addAll(parseEpisodes(firstDoc, seasonNumber = 1))
+        val (firstFillers, firstRecaps) = getJikanEpisodeFlags(malId)
+        allEpisodes.addAll(parseEpisodes(firstDoc, seasonNumber = 1, firstFillers, firstRecaps))
 
         val visitedForward = mutableSetOf(firstUrl.trimEnd('/'))
         var currentDoc = firstDoc
@@ -375,7 +438,9 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
 
             try {
                 val nextDoc = getSeriesDoc(nextHref, cookies)
-                val nextEps = parseEpisodes(nextDoc, seasonNumber = seasonNum)
+                val nextMalId = extractMalId(nextDoc)
+                val (nextFillers, nextRecaps) = getJikanEpisodeFlags(nextMalId)
+                val nextEps = parseEpisodes(nextDoc, seasonNumber = seasonNum, nextFillers, nextRecaps)
                 if (nextEps.isNotEmpty()) {
                     allEpisodes.addAll(nextEps)
                     seasonNum++
@@ -398,6 +463,79 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
         }
     }
 
+    private fun scheduleMarkEpisodeWatched(
+        doc: Document,
+        episodeUrl: String,
+        cookies: Map<String, String>,
+        delayMinutes: Long = 10L
+    ) {
+        try {
+            val html = doc.html()
+
+            fun extractParam(vararg names: String): String? {
+                for (n in names) {
+                    Regex("""$n\s*[:=]\s*['"]([^'"]+)['"]""").find(html)?.groupValues?.getOrNull(1)?.let {
+                        if (it.isNotBlank()) return it.trim()
+                    }
+                    Regex("""$n\s*[:=]\s*(\d+)""").find(html)?.groupValues?.getOrNull(1)?.let {
+                        if (it.isNotBlank()) return it.trim()
+                    }
+                    doc.selectFirst("input[name=$n], #$n")?.attr("value")?.trim()?.let {
+                        if (it.isNotBlank()) return it
+                    }
+                }
+                return null
+            }
+
+            val seriesId = extractParam("watchedSeriesId", "seriesId", "series_id") ?: return
+            val seriesLink = extractParam("watchedLink", "seriesLink", "series_link")
+                ?: Regex("""/nexus/anime/([^/]+)""").find(episodeUrl)?.groupValues?.getOrNull(1)
+                ?: return
+            val epNumber = extractParam("watchedNumber", "episodeNumber", "ep_number")
+                ?: Regex("""(\d+)(?:/?$|\?)""").find(episodeUrl)?.groupValues?.getOrNull(1)
+                ?: return
+            val seriesName = extractParam("watchedSeriesName", "seriesName", "series_name")
+                ?: doc.selectFirst("div.page-title h1, h1")?.text()?.substringBefore(" -")?.trim()
+                ?: ""
+
+            // Anuleaza timer-ul anterior daca ai schimbat episodul intre timp
+            pendingWatchTask?.cancel(false)
+
+            val cookieHeader = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+            val formBody = listOf(
+                "watchedSeriesId" to seriesId,
+                "watchedLink" to seriesLink,
+                "watchedNumber" to epNumber,
+                "watchedSeriesName" to seriesName,
+                "manual" to "0"
+            ).joinToString("&") { (k, v) ->
+                "${URLEncoder.encode(k, "UTF-8")}=${URLEncoder.encode(v, "UTF-8")}"
+            }
+
+            pendingWatchTask = watchScheduler.schedule({
+                try {
+                    val conn = URL("$mainUrl/nexus/ep_seen/watched_episode").openConnection() as HttpURLConnection
+                    conn.requestMethod = "POST"
+                    conn.doOutput = true
+                    conn.connectTimeout = 10000
+                    conn.readTimeout = 10000
+                    conn.setRequestProperty("Content-Type", "application/x-www-form-urlencoded; charset=UTF-8")
+                    conn.setRequestProperty("Origin", mainUrl)
+                    conn.setRequestProperty("Referer", episodeUrl)
+                    conn.setRequestProperty("X-Requested-With", "XMLHttpRequest")
+                    if (cookieHeader.isNotBlank()) {
+                        conn.setRequestProperty("Cookie", cookieHeader)
+                    }
+                    conn.outputStream.use { it.write(formBody.toByteArray(Charsets.UTF_8)) }
+                    conn.responseCode
+                    conn.disconnect()
+                } catch (_: Exception) {
+                }
+            }, delayMinutes, TimeUnit.MINUTES)
+        } catch (_: Exception) {
+        }
+    }
+
     override suspend fun loadLinks(
         data: String,
         isCasting: Boolean,
@@ -406,6 +544,8 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     ): Boolean {
         val cookies = getSessionCookies()
         val doc = app.get(data, cookies = cookies).document
+
+        scheduleMarkEpisodeWatched(doc, data, cookies, delayMinutes = 10L)
 
         val iframeUrls = doc.select("div.iframe_source iframe, iframe")
             .mapNotNull { iframe ->
