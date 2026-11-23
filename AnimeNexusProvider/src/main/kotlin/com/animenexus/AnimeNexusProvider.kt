@@ -4,9 +4,6 @@ import android.content.SharedPreferences
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.LoadResponse.Companion.addMalId
 import com.lagradost.cloudstream3.utils.*
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import org.json.JSONObject
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
@@ -26,12 +23,13 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime)
 
     companion object {
-        private val sessionMutex = Mutex()
-        private val seriesMutex = Mutex()
         private val watchScheduler = Executors.newSingleThreadScheduledExecutor()
+        @Volatile
         private var pendingWatchTask: ScheduledFuture<*>? = null
 
+        @Volatile
         private var sessionCookies: Map<String, String> = emptyMap()
+        @Volatile
         private var cachedSeries: List<NexusSeries>? = null
         private val cachedDocs = ConcurrentHashMap<String, Document>()
         private val cachedJikanFlags = ConcurrentHashMap<Int, Pair<Set<Int>, Set<Int>>>()
@@ -84,57 +82,56 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     }
 
     private suspend fun getSessionCookies(forceRefresh: Boolean = false): Map<String, String> {
-        return sessionMutex.withLock {
-            if (!forceRefresh) {
-                if (sessionCookies.isNotEmpty()) return@withLock sessionCookies
-                val saved = loadSavedCookies()
-                if (saved.isNotEmpty()) {
-                    sessionCookies = saved
-                    return@withLock saved
-                }
+        if (!forceRefresh) {
+            val current = sessionCookies
+            if (current.isNotEmpty()) return current
+            val saved = loadSavedCookies()
+            if (saved.isNotEmpty()) {
+                sessionCookies = saved
+                return saved
             }
-
-            val username = prefs.getString("username", "")?.trim().orEmpty()
-            val password = prefs.getString("password", "").orEmpty()
-
-            if (username.isBlank() || password.isBlank()) {
-                throw ErrorLoadingException("Configurează contul din Settings -> Extensions -> AnimeNexus (rotița de setări).")
-            }
-
-            val initCookies = app.get("$mainUrl/").cookies
-            val loginRes = app.post(
-                "$mainUrl/nexus/login_account",
-                data = mapOf(
-                    "referer" to "$mainUrl/",
-                    "loginUsername" to username,
-                    "loginPassword" to password,
-                    "loginRememberme" to "on"
-                ),
-                headers = mapOf(
-                    "Origin" to mainUrl,
-                    "Referer" to "$mainUrl/",
-                    "X-Requested-With" to "XMLHttpRequest"
-                ),
-                cookies = initCookies,
-                allowRedirects = false
-            )
-
-            val merged = (initCookies + loginRes.cookies)
-                .filterValues { it.isNotBlank() && it != "deleted" }
-
-            val portalRes = app.get(
-                "$mainUrl/nexus/portal-serii/anime",
-                headers = mapOf("Referer" to "$mainUrl/"),
-                cookies = merged
-            )
-
-            val finalCookies = (merged + portalRes.cookies)
-                .filterValues { it.isNotBlank() && it != "deleted" }
-
-            sessionCookies = finalCookies
-            saveCookies(finalCookies)
-            finalCookies
         }
+
+        val username = prefs.getString("username", "")?.trim().orEmpty()
+        val password = prefs.getString("password", "").orEmpty()
+
+        if (username.isBlank() || password.isBlank()) {
+            throw ErrorLoadingException("Configurează contul din Settings -> Extensions -> AnimeNexus (rotița de setări).")
+        }
+
+        val initCookies = app.get("$mainUrl/").cookies
+        val loginRes = app.post(
+            "$mainUrl/nexus/login_account",
+            data = mapOf(
+                "referer" to "$mainUrl/",
+                "loginUsername" to username,
+                "loginPassword" to password,
+                "loginRememberme" to "on"
+            ),
+            headers = mapOf(
+                "Origin" to mainUrl,
+                "Referer" to "$mainUrl/",
+                "X-Requested-With" to "XMLHttpRequest"
+            ),
+            cookies = initCookies,
+            allowRedirects = false
+        )
+
+        val merged = (initCookies + loginRes.cookies)
+            .filterValues { it.isNotBlank() && it != "deleted" }
+
+        val portalRes = app.get(
+            "$mainUrl/nexus/portal-serii/anime",
+            headers = mapOf("Referer" to "$mainUrl/"),
+            cookies = merged
+        )
+
+        val finalCookies = (merged + portalRes.cookies)
+            .filterValues { it.isNotBlank() && it != "deleted" }
+
+        sessionCookies = finalCookies
+        saveCookies(finalCookies)
+        return finalCookies
     }
 
     private suspend fun getSeriesDoc(url: String, cookies: Map<String, String>): Document {
@@ -163,51 +160,46 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     private suspend fun getAllSeries(): List<NexusSeries> {
         cachedSeries?.let { if (it.isNotEmpty()) return it }
 
-        return seriesMutex.withLock {
-            cachedSeries?.let { if (it.isNotEmpty()) return@withLock it }
-
-            var responseText = ""
-            for (attempt in 1..3) {
-                val cookies = getSessionCookies(forceRefresh = attempt > 1)
-                responseText = fetchSeriesJson(cookies)
-                if (responseText.startsWith("{")) break
-                delay(700)
-            }
-
-            if (!responseText.startsWith("{")) {
-                clearSession()
-                prefs.edit().remove("saved_cookies").apply()
-                throw ErrorLoadingException("Răspuns non-JSON: ${responseText.take(150)}")
-            }
-
-            val json = JSONObject(responseText)
-            val arr = json.optJSONArray("response")
-            if (arr == null || arr.length() == 0) {
-                clearSession()
-                prefs.edit().remove("saved_cookies").apply()
-                throw ErrorLoadingException("JSON fără listă: ${responseText.take(200)}")
-            }
-
-            val list = mutableListOf<NexusSeries>()
-            for (i in 0 until arr.length()) {
-                val obj = arr.optJSONObject(i) ?: continue
-                val name = obj.optString("name", "")
-                val link = obj.optString("link", "")
-                if (name.isBlank() || link.isBlank()) continue
-
-                val picture = obj.optString("picture", "").ifBlank { null }
-                val date = obj.optString("date", "")
-                val seenAmount = obj.optString("seen_amount", "0").toLongOrNull() ?: 0L
-                val seriesRating = obj.optDouble("series_rating", 0.0).let { if (it.isNaN()) 0.0 else it }
-
-                list.add(NexusSeries(name, link, picture, date, seenAmount, seriesRating))
-            }
-
-            if (list.isNotEmpty()) {
-                cachedSeries = list
-            }
-            list
+        var responseText = ""
+        for (attempt in 1..3) {
+            val cookies = getSessionCookies(forceRefresh = attempt > 1)
+            responseText = fetchSeriesJson(cookies)
+            if (responseText.startsWith("{")) break
         }
+
+        if (!responseText.startsWith("{")) {
+            clearSession()
+            prefs.edit().remove("saved_cookies").apply()
+            throw ErrorLoadingException("Răspuns non-JSON: ${responseText.take(150)}")
+        }
+
+        val json = JSONObject(responseText)
+        val arr = json.optJSONArray("response")
+        if (arr == null || arr.length() == 0) {
+            clearSession()
+            prefs.edit().remove("saved_cookies").apply()
+            throw ErrorLoadingException("JSON fără listă: ${responseText.take(200)}")
+        }
+
+        val list = mutableListOf<NexusSeries>()
+        for (i in 0 until arr.length()) {
+            val obj = arr.optJSONObject(i) ?: continue
+            val name = obj.optString("name", "")
+            val link = obj.optString("link", "")
+            if (name.isBlank() || link.isBlank()) continue
+
+            val picture = obj.optString("picture", "").ifBlank { null }
+            val date = obj.optString("date", "")
+            val seenAmount = obj.optString("seen_amount", "0").toLongOrNull() ?: 0L
+            val seriesRating = obj.optDouble("series_rating", 0.0).let { if (it.isNaN()) 0.0 else it }
+
+            list.add(NexusSeries(name, link, picture, date, seenAmount, seriesRating))
+        }
+
+        if (list.isNotEmpty()) {
+            cachedSeries = list
+        }
+        return list
     }
 
     private fun NexusSeries.toSearchResult(): SearchResponse {
