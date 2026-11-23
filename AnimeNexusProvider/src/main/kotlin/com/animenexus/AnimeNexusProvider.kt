@@ -23,6 +23,8 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
     override val supportedTypes = setOf(TvType.Anime)
 
     companion object {
+        private const val SERIES_CACHE_TTL_MS = 6L * 60L * 60L * 1000L // 6 ore
+
         private val watchScheduler = Executors.newSingleThreadScheduledExecutor()
         @Volatile
         private var pendingWatchTask: ScheduledFuture<*>? = null
@@ -157,9 +159,47 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
         ).text.trim()
     }
 
+    private fun parseSeriesJson(responseText: String): List<NexusSeries> {
+        if (!responseText.startsWith("{")) return emptyList()
+        return try {
+            val json = JSONObject(responseText)
+            val arr = json.optJSONArray("response") ?: return emptyList()
+            val list = mutableListOf<NexusSeries>()
+            for (i in 0 until arr.length()) {
+                val obj = arr.optJSONObject(i) ?: continue
+                val name = obj.optString("name", "")
+                val link = obj.optString("link", "")
+                if (name.isBlank() || link.isBlank()) continue
+
+                val picture = obj.optString("picture", "").ifBlank { null }
+                val date = obj.optString("date", "")
+                val seenAmount = obj.optString("seen_amount", "0").toLongOrNull() ?: 0L
+                val seriesRating = obj.optDouble("series_rating", 0.0).let { if (it.isNaN()) 0.0 else it }
+
+                list.add(NexusSeries(name, link, picture, date, seenAmount, seriesRating))
+            }
+            list
+        } catch (_: Exception) {
+            emptyList()
+        }
+    }
+
     private suspend fun getAllSeries(): List<NexusSeries> {
         cachedSeries?.let { if (it.isNotEmpty()) return it }
 
+        // 1. Verifica cache-ul local salvat pe telefon (valabil 6 ore)
+        val savedJson = prefs.getString("cached_series_json", null)
+        val savedTime = prefs.getLong("cached_series_time", 0L)
+        val now = System.currentTimeMillis()
+        if (!savedJson.isNullOrBlank() && (now - savedTime) < SERIES_CACHE_TTL_MS) {
+            val parsed = parseSeriesJson(savedJson)
+            if (parsed.isNotEmpty()) {
+                cachedSeries = parsed
+                return parsed
+            }
+        }
+
+        // 2. Descarca lista proaspata de pe server
         var responseText = ""
         for (attempt in 1..3) {
             val cookies = getSessionCookies(forceRefresh = attempt > 1)
@@ -167,39 +207,28 @@ class AnimeNexusProvider(private val prefs: SharedPreferences) : MainAPI() {
             if (responseText.startsWith("{")) break
         }
 
-        if (!responseText.startsWith("{")) {
-            clearSession()
-            prefs.edit().remove("saved_cookies").apply()
-            throw ErrorLoadingException("Răspuns non-JSON: ${responseText.take(150)}")
+        val freshList = parseSeriesJson(responseText)
+        if (freshList.isNotEmpty()) {
+            cachedSeries = freshList
+            prefs.edit()
+                .putString("cached_series_json", responseText)
+                .putLong("cached_series_time", now)
+                .apply()
+            return freshList
         }
 
-        val json = JSONObject(responseText)
-        val arr = json.optJSONArray("response")
-        if (arr == null || arr.length() == 0) {
-            clearSession()
-            prefs.edit().remove("saved_cookies").apply()
-            throw ErrorLoadingException("JSON fără listă: ${responseText.take(200)}")
+        // 3. Fallback la cache-ul vechi daca serverul nu raspunde
+        if (!savedJson.isNullOrBlank()) {
+            val fallback = parseSeriesJson(savedJson)
+            if (fallback.isNotEmpty()) {
+                cachedSeries = fallback
+                return fallback
+            }
         }
 
-        val list = mutableListOf<NexusSeries>()
-        for (i in 0 until arr.length()) {
-            val obj = arr.optJSONObject(i) ?: continue
-            val name = obj.optString("name", "")
-            val link = obj.optString("link", "")
-            if (name.isBlank() || link.isBlank()) continue
-
-            val picture = obj.optString("picture", "").ifBlank { null }
-            val date = obj.optString("date", "")
-            val seenAmount = obj.optString("seen_amount", "0").toLongOrNull() ?: 0L
-            val seriesRating = obj.optDouble("series_rating", 0.0).let { if (it.isNaN()) 0.0 else it }
-
-            list.add(NexusSeries(name, link, picture, date, seenAmount, seriesRating))
-        }
-
-        if (list.isNotEmpty()) {
-            cachedSeries = list
-        }
-        return list
+        clearSession()
+        prefs.edit().remove("saved_cookies").apply()
+        throw ErrorLoadingException("Răspuns invalid de la server: ${responseText.take(150)}")
     }
 
     private fun NexusSeries.toSearchResult(): SearchResponse {
