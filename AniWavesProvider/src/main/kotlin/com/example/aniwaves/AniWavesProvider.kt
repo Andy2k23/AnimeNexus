@@ -1,9 +1,8 @@
 package com.example.aniwaves
 
-import com.fasterxml.jackson.annotation.JsonProperty
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import com.lagradost.cloudstream3.utils.AppUtils.parseJson
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
 
@@ -42,23 +41,23 @@ class AniWavesProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val json = app.get(
+        val jsonText = app.get(
             request.data + page,
             headers = mapOf("X-Requested-With" to "XMLHttpRequest")
         ).text
-        val parsed = parseJson<HtmlResultResponse>(json)
-        val document = Jsoup.parse(parsed.result ?: "")
+        val html = JSONObject(jsonText).optString("result", "")
+        val document = Jsoup.parse(html)
         val items = document.select(".ani.items .item, .item").mapNotNull { it.toSearchResult() }
         return newHomePageResponse(request.name, items)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val json = app.get(
+        val jsonText = app.get(
             "$mainUrl/ajax/anime/search?keyword=$query",
             headers = mapOf("X-Requested-With" to "XMLHttpRequest")
         ).text
-        val parsed = parseJson<SearchResultResponse>(json)
-        val document = Jsoup.parse(parsed.result?.html ?: "")
+        val html = JSONObject(jsonText).optJSONObject("result")?.optString("html", "") ?: ""
+        val document = Jsoup.parse(html)
         return document.select(".item").mapNotNull { it.toSearchResult() }
     }
 
@@ -76,7 +75,7 @@ class AniWavesProvider : MainAPI() {
             "$mainUrl/ajax/episode/list/$animeId",
             headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to url)
         ).text
-        val epHtml = parseJson<HtmlResultResponse>(epJson).result ?: ""
+        val epHtml = JSONObject(epJson).optString("result", "")
         val epDoc = Jsoup.parse(epHtml)
 
         val episodes = epDoc.select("a[data-ids]").mapNotNull { ep ->
@@ -109,7 +108,8 @@ class AniWavesProvider : MainAPI() {
             "$mainUrl/ajax/server/list?servers=$data",
             headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to "$mainUrl/")
         ).text
-        val serverHtml = parseJson<HtmlResultResponse>(serverJson).result ?: return false
+        val serverHtml = JSONObject(serverJson).optString("result", "")
+        if (serverHtml.isBlank()) return false
         val serverDoc = Jsoup.parse(serverHtml)
 
         serverDoc.select(".servers .type").forEach { typeGroup ->
@@ -120,7 +120,7 @@ class AniWavesProvider : MainAPI() {
                     headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to "$mainUrl/")
                 ).text
 
-                val sourceUrl = parseJson<SourceResponse>(sourceJson).result?.url
+                val sourceUrl = JSONObject(sourceJson).optJSONObject("result")?.optString("url", "")
                 if (!sourceUrl.isNullOrBlank()) {
                     loadExtractor(sourceUrl, "$mainUrl/", subtitleCallback, callback)
                 }
@@ -128,26 +128,4 @@ class AniWavesProvider : MainAPI() {
         }
         return true
     }
-
-    data class HtmlResultResponse(
-        @JsonProperty("status") val status: Int? = null,
-        @JsonProperty("result") val result: String? = null
-    )
-
-    data class SearchResultResponse(
-        @JsonProperty("result") val result: SearchHtml? = null
-    )
-
-    data class SearchHtml(
-        @JsonProperty("html") val html: String? = null
-    )
-
-    data class SourceResponse(
-        @JsonProperty("status") val status: Int? = null,
-        @JsonProperty("result") val result: SourceData? = null
-    )
-
-    data class SourceData(
-        @JsonProperty("url") val url: String? = null
-    )
 }
