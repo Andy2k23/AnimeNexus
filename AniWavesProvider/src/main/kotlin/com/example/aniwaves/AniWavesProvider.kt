@@ -13,15 +13,17 @@ class AniWavesProvider : MainAPI() {
     override var lang = "en"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
-    private val ajaxHeaders = mapOf(
-        "X-Requested-With" to "XMLHttpRequest",
+    private val commonHeaders = mapOf(
+        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Referer" to "$mainUrl/home"
     )
 
+    private val ajaxHeaders = commonHeaders + ("X-Requested-With" to "XMLHttpRequest")
+
     override val mainPage = mainPageOf(
-        "$mainUrl/ajax/home/widget/updated-all?page=" to "Recently Updated",
-        "$mainUrl/ajax/home/widget/updated-sub?page=" to "Recently Updated (Sub)",
-        "$mainUrl/ajax/home/widget/updated-dub?page=" to "Recently Updated (Dub)"
+        "$mainUrl/updated?page=" to "Recently Updated",
+        "$mainUrl/newest?page=" to "Recently Added",
+        "$mainUrl/ongoing?page=" to "Ongoing"
     )
 
     private fun Element.toSearchResult(): AnimeSearchResponse? {
@@ -51,40 +53,24 @@ class AniWavesProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val response = app.get(request.data + page, headers = ajaxHeaders)
-        val responseText = response.text
-        val html = if (responseText.trim().startsWith("{")) {
-            JSONObject(responseText).optString("result", "")
-        } else {
-            responseText
-        }
-
-        val document = Jsoup.parse(html)
-        val items = document.select(".ani.items .item, .items .item, .item").mapNotNull { it.toSearchResult() }
+        val response = app.get(request.data + page, headers = commonHeaders)
+        val document = response.document
+        val items = document.select(".ani.items .item, .items .item").mapNotNull { it.toSearchResult() }
 
         if (items.isEmpty()) {
-            throw ErrorLoadingException("HTTP ${response.code} | ${responseText.take(300)}")
+            throw ErrorLoadingException("HTTP ${response.code} | ${response.text.take(300)}")
         }
 
         return newHomePageResponse(request.name, items)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val responseText = app.get(
-            "$mainUrl/ajax/anime/search?keyword=$query",
-            headers = ajaxHeaders
-        ).text
-        val html = if (responseText.trim().startsWith("{")) {
-            JSONObject(responseText).optJSONObject("result")?.optString("html", "") ?: ""
-        } else {
-            responseText
-        }
-        val document = Jsoup.parse(html)
-        return document.select(".item, a.item").mapNotNull { it.toSearchResult() }
+        val response = app.get("$mainUrl/filter?keyword=$query", headers = commonHeaders)
+        return response.document.select(".ani.items .item, .items .item").mapNotNull { it.toSearchResult() }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url, headers = mapOf("Referer" to "$mainUrl/home")).document
+        val document = app.get(url, headers = commonHeaders).document
         val watchBlock = document.selectFirst(".layout-page-watchtv, [data-id]")
         val animeId = watchBlock?.attr("data-id")
             ?: throw ErrorLoadingException("Nu am găsit data-id pe pagina anime-ului")
@@ -95,7 +81,7 @@ class AniWavesProvider : MainAPI() {
 
         val epJson = app.get(
             "$mainUrl/ajax/episode/list/$animeId",
-            headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to url)
+            headers = ajaxHeaders + ("Referer" to url)
         ).text
         val epHtml = JSONObject(epJson).optString("result", "")
         val epDoc = Jsoup.parse(epHtml)
