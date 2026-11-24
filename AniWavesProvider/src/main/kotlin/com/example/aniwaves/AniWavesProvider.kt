@@ -13,6 +13,11 @@ class AniWavesProvider : MainAPI() {
     override var lang = "en"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
+    private val ajaxHeaders = mapOf(
+        "X-Requested-With" to "XMLHttpRequest",
+        "Referer" to "$mainUrl/home"
+    )
+
     override val mainPage = mainPageOf(
         "$mainUrl/ajax/home/widget/updated-all?page=" to "Recently Updated",
         "$mainUrl/ajax/home/widget/updated-sub?page=" to "Recently Updated (Sub)",
@@ -20,9 +25,14 @@ class AniWavesProvider : MainAPI() {
     )
 
     private fun Element.toSearchResult(): AnimeSearchResponse? {
-        val linkEl = this.selectFirst(".info a.name, a.name, .poster > a") ?: return null
-        val title = this.selectFirst(".info .name, .name")?.text()?.trim() ?: return null
-        val href = fixUrl(linkEl.attr("href"))
+        val linkEl = this.selectFirst("a.d-title, .info a.name, a.name, .poster a, a[href*='/watch/']") ?: return null
+        val href = fixUrl(linkEl.attr("href").ifBlank { return null })
+        val title = this.selectFirst(".d-title, .info .name, .name")?.text()?.trim()
+            ?.ifBlank { null }
+            ?: linkEl.attr("title").ifBlank { null }
+            ?: this.selectFirst("img")?.attr("alt")?.ifBlank { null }
+            ?: return null
+
         val posterUrl = this.selectFirst("img")?.let {
             it.attr("data-src").ifBlank { it.attr("src") }
         }
@@ -41,33 +51,46 @@ class AniWavesProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val jsonText = app.get(
-            request.data + page,
-            headers = mapOf("X-Requested-With" to "XMLHttpRequest")
-        ).text
-        val html = JSONObject(jsonText).optString("result", "")
+        val responseText = app.get(request.data + page, headers = ajaxHeaders).text
+        val html = if (responseText.trim().startsWith("{")) {
+            JSONObject(responseText).optString("result", "")
+        } else {
+            responseText
+        }
+
         val document = Jsoup.parse(html)
-        val items = document.select(".ani.items .item, .item").mapNotNull { it.toSearchResult() }
+        var items = document.select(".ani.items .item, .items .item, .item").mapNotNull { it.toSearchResult() }
+
+        // Fallback pe pagina /home dacă widget-ul AJAX nu returnează nimic pe pagina 1
+        if (items.isEmpty() && page == 1) {
+            val homeDoc = app.get("$mainUrl/home").document
+            items = homeDoc.select(".ani.items .item, .items .item").mapNotNull { it.toSearchResult() }
+        }
+
         return newHomePageResponse(request.name, items)
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val jsonText = app.get(
+        val responseText = app.get(
             "$mainUrl/ajax/anime/search?keyword=$query",
-            headers = mapOf("X-Requested-With" to "XMLHttpRequest")
+            headers = ajaxHeaders
         ).text
-        val html = JSONObject(jsonText).optJSONObject("result")?.optString("html", "") ?: ""
+        val html = if (responseText.trim().startsWith("{")) {
+            JSONObject(responseText).optJSONObject("result")?.optString("html", "") ?: ""
+        } else {
+            responseText
+        }
         val document = Jsoup.parse(html)
-        return document.select(".item").mapNotNull { it.toSearchResult() }
+        return document.select(".item, a.item").mapNotNull { it.toSearchResult() }
     }
 
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url).document
-        val watchBlock = document.selectFirst(".layout-page-watchtv")
+        val document = app.get(url, headers = mapOf("Referer" to "$mainUrl/home")).document
+        val watchBlock = document.selectFirst(".layout-page-watchtv, [data-id]")
         val animeId = watchBlock?.attr("data-id")
             ?: throw ErrorLoadingException("Nu am găsit data-id pe pagina anime-ului")
 
-        val title = document.selectFirst("h1.title, .info .title, h2.title")?.text()?.trim() ?: "Unknown"
+        val title = document.selectFirst("h1.title, .info .title, h2.title, .d-title")?.text()?.trim() ?: "Unknown"
         val poster = document.selectFirst(".poster img, #w-info img")?.attr("src")
         val plot = document.selectFirst(".synopsis .content, .shorting .content")?.text()?.trim()
 
@@ -106,7 +129,7 @@ class AniWavesProvider : MainAPI() {
     ): Boolean {
         val serverJson = app.get(
             "$mainUrl/ajax/server/list?servers=$data",
-            headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to "$mainUrl/")
+            headers = ajaxHeaders
         ).text
         val serverHtml = JSONObject(serverJson).optString("result", "")
         if (serverHtml.isBlank()) return false
@@ -117,7 +140,7 @@ class AniWavesProvider : MainAPI() {
                 val linkId = serverLi.attr("data-link-id")
                 val sourceJson = app.get(
                     "$mainUrl/ajax/sources?id=$linkId&asi=0&autoPlay=0",
-                    headers = mapOf("X-Requested-With" to "XMLHttpRequest", "Referer" to "$mainUrl/")
+                    headers = ajaxHeaders
                 ).text
 
                 val sourceUrl = JSONObject(sourceJson).optJSONObject("result")?.optString("url", "")
