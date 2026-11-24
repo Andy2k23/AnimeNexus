@@ -51,7 +51,8 @@ class AniWavesProvider : MainAPI() {
     }
 
     override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val responseText = app.get(request.data + page, headers = ajaxHeaders).text
+        val response = app.get(request.data + page, headers = ajaxHeaders)
+        val responseText = response.text
         val html = if (responseText.trim().startsWith("{")) {
             JSONObject(responseText).optString("result", "")
         } else {
@@ -59,12 +60,10 @@ class AniWavesProvider : MainAPI() {
         }
 
         val document = Jsoup.parse(html)
-        var items = document.select(".ani.items .item, .items .item, .item").mapNotNull { it.toSearchResult() }
+        val items = document.select(".ani.items .item, .items .item, .item").mapNotNull { it.toSearchResult() }
 
-        // Fallback pe pagina /home dacă widget-ul AJAX nu returnează nimic pe pagina 1
-        if (items.isEmpty() && page == 1) {
-            val homeDoc = app.get("$mainUrl/home").document
-            items = homeDoc.select(".ani.items .item, .items .item").mapNotNull { it.toSearchResult() }
+        if (items.isEmpty()) {
+            throw ErrorLoadingException("HTTP ${response.code} | ${responseText.take(300)}")
         }
 
         return newHomePageResponse(request.name, items)
