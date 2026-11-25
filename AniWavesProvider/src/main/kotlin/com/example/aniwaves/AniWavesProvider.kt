@@ -72,7 +72,6 @@ class AniWavesProvider : MainAPI() {
 
         val title = document.selectFirst("h1.title, .info .title, h2.title, .d-title")?.text()?.trim() ?: "Unknown"
         val poster = document.selectFirst(".poster img, #w-info img")?.attr("src")
-        val plot = document.selectFirst(".synopsis .content, .shorting .content")?.text()?.trim()
 
         val epJson = app.get(
             "$mainUrl/ajax/episode/list/$animeId",
@@ -94,9 +93,24 @@ class AniWavesProvider : MainAPI() {
             }
         }
 
+        // Debug pentru primul episod direct în descriere
+        var debugInfo = "No episodes"
+        val firstIds = episodes.firstOrNull()?.data
+        if (!firstIds.isNullOrBlank()) {
+            val srvResp = app.get("$mainUrl/ajax/server/list?servers=$firstIds", headers = ajaxHeaders + ("Referer" to url)).text
+            val srvHtml = if (srvResp.trim().startsWith("{")) JSONObject(srvResp).optString("result", "") else srvResp
+            val firstLinkId = Jsoup.parse(srvHtml).selectFirst("li[data-link-id]")?.attr("data-link-id")
+            if (firstLinkId.isNullOrBlank()) {
+                debugInfo = "SRV_EMPTY | ids=$firstIds | resp=${srvResp.take(150)}"
+            } else {
+                val srcResp = app.get("$mainUrl/ajax/sources?id=$firstLinkId&asi=0&autoPlay=0", headers = ajaxHeaders + ("Referer" to url)).text
+                debugInfo = "LINK_ID=$firstLinkId | SRC=${srcResp.take(250)}"
+            }
+        }
+
         return newAnimeLoadResponse(title, url, TvType.Anime) {
             this.posterUrl = poster
-            this.plot = plot
+            this.plot = "DEBUG: $debugInfo"
             addEpisodes(DubStatus.Subbed, episodes)
         }
     }
@@ -115,16 +129,7 @@ class AniWavesProvider : MainAPI() {
         }
 
         val serverDoc = Jsoup.parse(serverHtml)
-        val serverItems = serverDoc.select("li[data-link-id]")
-
-        if (serverItems.isEmpty()) {
-            throw ErrorLoadingException("SERVER_ERR | data=$data | resp=${serverResp.take(200)}")
-        }
-
-        var foundLinks = 0
-        val debugUrls = mutableListOf<String>()
-
-        serverItems.forEach { serverLi ->
+        serverDoc.select("li[data-link-id]").forEach { serverLi ->
             val linkId = serverLi.attr("data-link-id")
             val sourceResp = app.get(
                 "$mainUrl/ajax/sources?id=$linkId&asi=0&autoPlay=0",
@@ -138,20 +143,9 @@ class AniWavesProvider : MainAPI() {
             }
 
             if (!sourceUrl.isNullOrBlank()) {
-                debugUrls.add(sourceUrl)
-                loadExtractor(sourceUrl, "$mainUrl/", subtitleCallback) { link ->
-                    foundLinks++
-                    callback.invoke(link)
-                }
-            } else {
-                debugUrls.add("EMPTY:${sourceResp.take(80)}")
+                loadExtractor(sourceUrl, "$mainUrl/", subtitleCallback, callback)
             }
         }
-
-        if (foundLinks == 0) {
-            throw ErrorLoadingException("NO_EXTRACTOR | urls=${debugUrls.joinToString(" , ")}")
-        }
-
         return true
     }
 }
