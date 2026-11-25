@@ -1,4 +1,4 @@
-version = 5
+version = 8
 
 cloudstream {
     description = "AniWaves Anime Provider"
