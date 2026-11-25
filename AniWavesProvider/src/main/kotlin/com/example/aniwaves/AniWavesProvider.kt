@@ -15,8 +15,10 @@ class AniWavesProvider : MainAPI() {
     override var lang = "en"
     override val supportedTypes = setOf(TvType.Anime, TvType.AnimeMovie, TvType.OVA)
 
+    private val userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+
     private val commonHeaders = mapOf(
-        "User-Agent" to "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "User-Agent" to userAgent,
         "Referer" to "$mainUrl/home"
     )
 
@@ -148,17 +150,16 @@ class AniWavesProvider : MainAPI() {
                         mainUrl
                     }
 
-                    // Încarcă pagina de embed mai întâi pentru cookie-uri de sesiune
-                    val embedPage = app.get(rawUrl, headers = commonHeaders)
-
                     val embedResp = app.get(
                         getSourcesUrl,
-                        headers = commonHeaders + mapOf(
+                        headers = mapOf(
+                            "User-Agent" to userAgent,
+                            "Accept" to "application/json",
                             "Referer" to rawUrl,
-                            "Origin" to embedOrigin,
-                            "X-Requested-With" to "XMLHttpRequest"
-                        ),
-                        cookies = embedPage.cookies
+                            "Sec-Fetch-Dest" to "empty",
+                            "Sec-Fetch-Mode" to "cors",
+                            "Sec-Fetch-Site" to "same-origin"
+                        )
                     ).text
 
                     if (embedResp.trim().startsWith("{")) {
