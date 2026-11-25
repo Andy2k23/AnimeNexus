@@ -119,7 +119,7 @@ class AniWavesProvider : MainAPI() {
 
         val serverDoc = Jsoup.parse(serverHtml)
 
-        serverDoc.select("li[data-link-id]").apmap { serverLi ->
+        serverDoc.select("li[data-link-id]").amap { serverLi ->
             try {
                 val linkId = serverLi.attr("data-link-id")
                 val serverName = serverLi.text().trim().ifBlank { "Server" }
