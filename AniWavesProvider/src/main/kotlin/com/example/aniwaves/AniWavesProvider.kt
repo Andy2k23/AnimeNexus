@@ -117,47 +117,50 @@ class AniWavesProvider : MainAPI() {
         if (serverHtml.isBlank()) return false
 
         val serverDoc = Jsoup.parse(serverHtml)
-        val resolver = WebViewResolver(Regex("""\.m3u8"""))
+        val resolver = WebViewResolver(Regex("""(\.m3u8|master\.txt|\.mp4)"""))
 
-        serverDoc.select(".servers .type").forEach { typeGroup ->
-            val typeLabel = typeGroup.attr("data-type").uppercase().ifBlank { "SUB" }
-            typeGroup.select("li[data-link-id]").forEach { serverLi ->
-                val linkId = serverLi.attr("data-link-id")
-                val serverName = serverLi.text().trim().ifBlank { "Server" }
-                val sourceResp = app.get(
-                    "$mainUrl/ajax/sources?id=$linkId&asi=0&autoPlay=0",
-                    headers = ajaxHeaders
-                ).text
+        serverDoc.select("li[data-link-id]").forEach { serverLi ->
+            val linkId = serverLi.attr("data-link-id")
+            val serverName = serverLi.text().trim().ifBlank { "Server" }
+            val typeLabel = serverLi.closest(".type")?.attr("data-type")?.uppercase()?.ifBlank { "SUB" } ?: "SUB"
 
-                val sourceUrl = if (sourceResp.trim().startsWith("{")) {
-                    JSONObject(sourceResp).optJSONObject("result")?.optString("url", "")
-                } else {
-                    ""
-                }
+            val sourceResp = app.get(
+                "$mainUrl/ajax/sources?id=$linkId&asi=0&autoPlay=1",
+                headers = ajaxHeaders
+            ).text
 
-                if (!sourceUrl.isNullOrBlank()) {
-                    var extracted = false
-                    loadExtractor(sourceUrl, "$mainUrl/", subtitleCallback) { link ->
-                        extracted = true
-                        callback.invoke(link)
-                    }
+            val rawUrl = if (sourceResp.trim().startsWith("{")) {
+                JSONObject(sourceResp).optJSONObject("result")?.optString("url", "")
+            } else {
+                ""
+            }
 
-                    if (!extracted) {
-                        val resolved = app.get(
-                            sourceUrl,
-                            referer = "$mainUrl/",
-                            interceptor = resolver
+            if (!rawUrl.isNullOrBlank()) {
+                val embedUrl = if (rawUrl.contains("?")) "$rawUrl&autostart=true" else "$rawUrl?autostart=true"
+                val resolved = app.get(
+                    embedUrl,
+                    referer = "$mainUrl/",
+                    interceptor = resolver
+                )
+                val streamUrl = resolved.url
+                if (streamUrl.contains(".m3u8") || streamUrl.contains("master.txt")) {
+                    val embedOrigin = rawUrl.substringBefore("/embed") + "/"
+                    M3u8Helper.generateM3u8(
+                        source = "$name [$typeLabel - $serverName]",
+                        streamUrl = streamUrl,
+                        referer = embedOrigin
+                    ).forEach(callback)
+                } else if (streamUrl.contains(".mp4")) {
+                    callback.invoke(
+                        ExtractorLink(
+                            source = name,
+                            name = "$name [$typeLabel - $serverName]",
+                            url = streamUrl,
+                            referer = rawUrl,
+                            quality = Qualities.Unknown.value,
+                            isM3u8 = false
                         )
-                        val m3u8Url = resolved.url
-                        if (m3u8Url.contains(".m3u8")) {
-                            val embedOrigin = sourceUrl.substringBefore("/embed") + "/"
-                            M3u8Helper.generateM3u8(
-                                source = "$name [$typeLabel - $serverName]",
-                                streamUrl = m3u8Url,
-                                referer = embedOrigin
-                            ).forEach(callback)
-                        }
-                    }
+                    )
                 }
             }
         }
