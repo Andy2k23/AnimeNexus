@@ -152,14 +152,14 @@ class AniWavesProvider : MainAPI() {
                     ).forEach(callback)
                 } else if (streamUrl.contains(".mp4")) {
                     callback.invoke(
-                        ExtractorLink(
+                        newExtractorLink(
                             source = name,
                             name = "$name [$typeLabel - $serverName]",
-                            url = streamUrl,
-                            referer = rawUrl,
-                            quality = Qualities.Unknown.value,
-                            isM3u8 = false
-                        )
+                            url = streamUrl
+                        ) {
+                            this.referer = rawUrl
+                            this.quality = Qualities.Unknown.value
+                        }
                     )
                 }
             }
