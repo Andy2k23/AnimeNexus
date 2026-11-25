@@ -72,47 +72,37 @@ class AniWavesProvider : MainAPI() {
         val document = app.get(url, headers = commonHeaders).document
         val watchBlock = document.selectFirst(".layout-page-watchtv, [data-id]")
         val animeId = watchBlock?.attr("data-id")
-            ?: throw ErrorLoadingException("Nu am găsit data-id")
+            ?: throw ErrorLoadingException("Nu am găsit data-id pe pagina anime-ului")
+
+        val title = document.selectFirst("h1.title, .info .title, h2.title, .d-title")?.text()?.trim() ?: "Unknown"
+        val poster = document.selectFirst(".poster img, #w-info img")?.attr("src")
+        val plot = document.selectFirst(".synopsis .content, .shorting .content")?.text()?.trim()
 
         val epJson = app.get(
             "$mainUrl/ajax/episode/list/$animeId",
             headers = ajaxHeaders + ("Referer" to url)
         ).text
-        val firstIds = Jsoup.parse(JSONObject(epJson).optString("result", ""))
-            .selectFirst("a[data-ids]")?.attr("data-ids")
-            ?: throw ErrorLoadingException("EP_EMPTY")
+        val epHtml = JSONObject(epJson).optString("result", "")
+        val epDoc = Jsoup.parse(epHtml)
 
-        val srvResp = app.get(
-            "$mainUrl/ajax/server/list?servers=$firstIds",
-            headers = ajaxHeaders + ("Referer" to url)
-        ).text
-        val srvHtml = if (srvResp.trim().startsWith("{")) JSONObject(srvResp).optString("result", "") else srvResp
-        val firstLinkId = Jsoup.parse(srvHtml).selectFirst("li[data-link-id]")?.attr("data-link-id")
-            ?: throw ErrorLoadingException("SRV_EMPTY")
+        val episodes = epDoc.select("a[data-ids]").mapNotNull { ep ->
+            val ids = ep.attr("data-ids").ifBlank { return@mapNotNull null }
+            val num = ep.attr("data-num").toIntOrNull()
+            val epTitle = ep.selectFirst(".d-title")?.text()?.trim()
+                ?: ep.parent()?.attr("title")?.substringAfterLast(" - ")?.trim()
+                ?: "Episode ${ep.attr("data-num")}"
 
-        val srcResp = app.get(
-            "$mainUrl/ajax/sources?id=$firstLinkId&asi=0&autoPlay=1",
-            headers = ajaxHeaders + ("Referer" to url)
-        ).text
-        val rawUrl = JSONObject(srcResp).optJSONObject("result")?.optString("url", "")
-            ?: throw ErrorLoadingException("RAW_URL_EMPTY | $srcResp")
+            newEpisode("$mainUrl/ajax/server/list?servers=$ids") {
+                this.episode = num
+                this.name = if (ep.hasClass("filler")) "[Filler] $epTitle" else epTitle
+            }
+        }
 
-        val cleanUrl = rawUrl.substringBefore("?")
-        val getSourcesUrl = "${cleanUrl.substringBeforeLast("/")}/getSources?id=${cleanUrl.substringAfterLast("/")}"
-
-        val embedResp = app.get(
-            getSourcesUrl,
-            headers = mapOf(
-                "User-Agent" to userAgent,
-                "Accept" to "application/json",
-                "Referer" to rawUrl,
-                "Sec-Fetch-Dest" to "empty",
-                "Sec-Fetch-Mode" to "cors",
-                "Sec-Fetch-Site" to "same-origin"
-            )
-        )
-
-        throw ErrorLoadingException("URL=$getSourcesUrl | HTTP=${embedResp.code} | BODY=${embedResp.text.take(250)}")
+        return newAnimeLoadResponse(title, url, TvType.Anime) {
+            this.posterUrl = poster
+            this.plot = plot
+            addEpisodes(DubStatus.Subbed, episodes)
+        }
     }
 
     override suspend fun loadLinks(
@@ -121,7 +111,7 @@ class AniWavesProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val serverResp = app.get("$mainUrl/ajax/server/list?servers=$data", headers = ajaxHeaders).text
+        val serverResp = app.get(data, headers = ajaxHeaders).text
         val serverHtml = if (serverResp.trim().startsWith("{")) {
             JSONObject(serverResp).optString("result", "")
         } else {
