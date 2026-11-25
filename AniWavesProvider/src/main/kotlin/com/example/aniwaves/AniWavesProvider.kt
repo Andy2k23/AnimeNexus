@@ -1,6 +1,7 @@
 package com.example.aniwaves
 
 import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
 import org.json.JSONObject
 import org.jsoup.Jsoup
@@ -70,6 +71,10 @@ class AniWavesProvider : MainAPI() {
         val animeId = watchBlock?.attr("data-id")
             ?: throw ErrorLoadingException("Nu am găsit data-id pe pagina anime-ului")
 
+        val title = document.selectFirst("h1.title, .info .title, h2.title, .d-title")?.text()?.trim() ?: "Unknown"
+        val poster = document.selectFirst(".poster img, #w-info img")?.attr("src")
+        val plot = document.selectFirst(".synopsis .content, .shorting .content")?.text()?.trim()
+
         val epJson = app.get(
             "$mainUrl/ajax/episode/list/$animeId",
             headers = ajaxHeaders + ("Referer" to url)
@@ -77,16 +82,24 @@ class AniWavesProvider : MainAPI() {
         val epHtml = JSONObject(epJson).optString("result", "")
         val epDoc = Jsoup.parse(epHtml)
 
-        val firstIds = epDoc.selectFirst("a[data-ids]")?.attr("data-ids")
-            ?: throw ErrorLoadingException("EP_EMPTY | animeId=$animeId | epJson=${epJson.take(150)}")
+        val episodes = epDoc.select("a[data-ids]").mapNotNull { ep ->
+            val ids = ep.attr("data-ids").ifBlank { return@mapNotNull null }
+            val num = ep.attr("data-num").toIntOrNull()
+            val epTitle = ep.selectFirst(".d-title")?.text()?.trim()
+                ?: ep.parent()?.attr("title")?.substringAfterLast(" - ")?.trim()
+                ?: "Episode ${ep.attr("data-num")}"
 
-        val srvResp = app.get("$mainUrl/ajax/server/list?servers=$firstIds", headers = ajaxHeaders + ("Referer" to url)).text
-        val srvHtml = if (srvResp.trim().startsWith("{")) JSONObject(srvResp).optString("result", "") else srvResp
-        val firstLinkId = Jsoup.parse(srvHtml).selectFirst("li[data-link-id]")?.attr("data-link-id")
-            ?: throw ErrorLoadingException("SRV_EMPTY | ids=$firstIds | resp=${srvResp.take(200)}")
+            newEpisode(ids) {
+                this.episode = num
+                this.name = if (ep.hasClass("filler")) "[Filler] $epTitle" else epTitle
+            }
+        }
 
-        val srcResp = app.get("$mainUrl/ajax/sources?id=$firstLinkId&asi=0&autoPlay=0", headers = ajaxHeaders + ("Referer" to url)).text
-        throw ErrorLoadingException("LINK_ID=$firstLinkId | SRC=${srcResp.take(300)}")
+        return newAnimeLoadResponse(title, url, TvType.Anime) {
+            this.posterUrl = poster
+            this.plot = plot
+            addEpisodes(DubStatus.Subbed, episodes)
+        }
     }
 
     override suspend fun loadLinks(
@@ -95,6 +108,59 @@ class AniWavesProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        return false
+        val serverResp = app.get("$mainUrl/ajax/server/list?servers=$data", headers = ajaxHeaders).text
+        val serverHtml = if (serverResp.trim().startsWith("{")) {
+            JSONObject(serverResp).optString("result", "")
+        } else {
+            serverResp
+        }
+        if (serverHtml.isBlank()) return false
+
+        val serverDoc = Jsoup.parse(serverHtml)
+        val resolver = WebViewResolver(Regex("""\.m3u8"""))
+
+        serverDoc.select(".servers .type").forEach { typeGroup ->
+            val typeLabel = typeGroup.attr("data-type").uppercase().ifBlank { "SUB" }
+            typeGroup.select("li[data-link-id]").forEach { serverLi ->
+                val linkId = serverLi.attr("data-link-id")
+                val serverName = serverLi.text().trim().ifBlank { "Server" }
+                val sourceResp = app.get(
+                    "$mainUrl/ajax/sources?id=$linkId&asi=0&autoPlay=0",
+                    headers = ajaxHeaders
+                ).text
+
+                val sourceUrl = if (sourceResp.trim().startsWith("{")) {
+                    JSONObject(sourceResp).optJSONObject("result")?.optString("url", "")
+                } else {
+                    ""
+                }
+
+                if (!sourceUrl.isNullOrBlank()) {
+                    var extracted = false
+                    loadExtractor(sourceUrl, "$mainUrl/", subtitleCallback) { link ->
+                        extracted = true
+                        callback.invoke(link)
+                    }
+
+                    if (!extracted) {
+                        val resolved = app.get(
+                            sourceUrl,
+                            referer = "$mainUrl/",
+                            interceptor = resolver
+                        )
+                        val m3u8Url = resolved.url
+                        if (m3u8Url.contains(".m3u8")) {
+                            val embedOrigin = sourceUrl.substringBefore("/embed") + "/"
+                            M3u8Helper.generateM3u8(
+                                source = "$name [$typeLabel - $serverName]",
+                                streamUrl = m3u8Url,
+                                referer = embedOrigin
+                            ).forEach(callback)
+                        }
+                    }
+                }
+            }
+        }
+        return true
     }
 }
