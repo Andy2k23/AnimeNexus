@@ -70,9 +70,6 @@ class AniWavesProvider : MainAPI() {
         val animeId = watchBlock?.attr("data-id")
             ?: throw ErrorLoadingException("Nu am găsit data-id pe pagina anime-ului")
 
-        val title = document.selectFirst("h1.title, .info .title, h2.title, .d-title")?.text()?.trim() ?: "Unknown"
-        val poster = document.selectFirst(".poster img, #w-info img")?.attr("src")
-
         val epJson = app.get(
             "$mainUrl/ajax/episode/list/$animeId",
             headers = ajaxHeaders + ("Referer" to url)
@@ -80,39 +77,16 @@ class AniWavesProvider : MainAPI() {
         val epHtml = JSONObject(epJson).optString("result", "")
         val epDoc = Jsoup.parse(epHtml)
 
-        val episodes = epDoc.select("a[data-ids]").mapNotNull { ep ->
-            val ids = ep.attr("data-ids").ifBlank { return@mapNotNull null }
-            val num = ep.attr("data-num").toIntOrNull()
-            val epTitle = ep.selectFirst(".d-title")?.text()?.trim()
-                ?: ep.parent()?.attr("title")?.substringAfterLast(" - ")?.trim()
-                ?: "Episode ${ep.attr("data-num")}"
+        val firstIds = epDoc.selectFirst("a[data-ids]")?.attr("data-ids")
+            ?: throw ErrorLoadingException("EP_EMPTY | animeId=$animeId | epJson=${epJson.take(150)}")
 
-            newEpisode(ids) {
-                this.episode = num
-                this.name = if (ep.hasClass("filler")) "[Filler] $epTitle" else epTitle
-            }
-        }
+        val srvResp = app.get("$mainUrl/ajax/server/list?servers=$firstIds", headers = ajaxHeaders + ("Referer" to url)).text
+        val srvHtml = if (srvResp.trim().startsWith("{")) JSONObject(srvResp).optString("result", "") else srvResp
+        val firstLinkId = Jsoup.parse(srvHtml).selectFirst("li[data-link-id]")?.attr("data-link-id")
+            ?: throw ErrorLoadingException("SRV_EMPTY | ids=$firstIds | resp=${srvResp.take(200)}")
 
-        // Debug pentru primul episod direct în descriere
-        var debugInfo = "No episodes"
-        val firstIds = episodes.firstOrNull()?.data
-        if (!firstIds.isNullOrBlank()) {
-            val srvResp = app.get("$mainUrl/ajax/server/list?servers=$firstIds", headers = ajaxHeaders + ("Referer" to url)).text
-            val srvHtml = if (srvResp.trim().startsWith("{")) JSONObject(srvResp).optString("result", "") else srvResp
-            val firstLinkId = Jsoup.parse(srvHtml).selectFirst("li[data-link-id]")?.attr("data-link-id")
-            if (firstLinkId.isNullOrBlank()) {
-                debugInfo = "SRV_EMPTY | ids=$firstIds | resp=${srvResp.take(150)}"
-            } else {
-                val srcResp = app.get("$mainUrl/ajax/sources?id=$firstLinkId&asi=0&autoPlay=0", headers = ajaxHeaders + ("Referer" to url)).text
-                debugInfo = "LINK_ID=$firstLinkId | SRC=${srcResp.take(250)}"
-            }
-        }
-
-        return newAnimeLoadResponse(title, url, TvType.Anime) {
-            this.posterUrl = poster
-            this.plot = "DEBUG: $debugInfo"
-            addEpisodes(DubStatus.Subbed, episodes)
-        }
+        val srcResp = app.get("$mainUrl/ajax/sources?id=$firstLinkId&asi=0&autoPlay=0", headers = ajaxHeaders + ("Referer" to url)).text
+        throw ErrorLoadingException("LINK_ID=$firstLinkId | SRC=${srcResp.take(300)}")
     }
 
     override suspend fun loadLinks(
@@ -121,31 +95,6 @@ class AniWavesProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val serverResp = app.get("$mainUrl/ajax/server/list?servers=$data", headers = ajaxHeaders).text
-        val serverHtml = if (serverResp.trim().startsWith("{")) {
-            JSONObject(serverResp).optString("result", "")
-        } else {
-            serverResp
-        }
-
-        val serverDoc = Jsoup.parse(serverHtml)
-        serverDoc.select("li[data-link-id]").forEach { serverLi ->
-            val linkId = serverLi.attr("data-link-id")
-            val sourceResp = app.get(
-                "$mainUrl/ajax/sources?id=$linkId&asi=0&autoPlay=0",
-                headers = ajaxHeaders
-            ).text
-
-            val sourceUrl = if (sourceResp.trim().startsWith("{")) {
-                JSONObject(sourceResp).optJSONObject("result")?.optString("url", "")
-            } else {
-                ""
-            }
-
-            if (!sourceUrl.isNullOrBlank()) {
-                loadExtractor(sourceUrl, "$mainUrl/", subtitleCallback, callback)
-            }
-        }
-        return true
+        return false
     }
 }
