@@ -56,11 +56,6 @@ class AniWavesProvider : MainAPI() {
         val response = app.get(request.data + page, headers = commonHeaders)
         val document = response.document
         val items = document.select(".ani.items .item, .items .item").mapNotNull { it.toSearchResult() }
-
-        if (items.isEmpty()) {
-            throw ErrorLoadingException("HTTP ${response.code} | ${response.text.take(300)}")
-        }
-
         return newHomePageResponse(request.name, items)
     }
 
@@ -112,28 +107,51 @@ class AniWavesProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val serverJson = app.get(
-            "$mainUrl/ajax/server/list?servers=$data",
-            headers = ajaxHeaders
-        ).text
-        val serverHtml = JSONObject(serverJson).optString("result", "")
-        if (serverHtml.isBlank()) return false
+        val serverResp = app.get("$mainUrl/ajax/server/list?servers=$data", headers = ajaxHeaders).text
+        val serverHtml = if (serverResp.trim().startsWith("{")) {
+            JSONObject(serverResp).optString("result", "")
+        } else {
+            serverResp
+        }
+
         val serverDoc = Jsoup.parse(serverHtml)
+        val serverItems = serverDoc.select("li[data-link-id]")
 
-        serverDoc.select(".servers .type").forEach { typeGroup ->
-            typeGroup.select("li[data-link-id]").forEach { serverLi ->
-                val linkId = serverLi.attr("data-link-id")
-                val sourceJson = app.get(
-                    "$mainUrl/ajax/sources?id=$linkId&asi=0&autoPlay=0",
-                    headers = ajaxHeaders
-                ).text
+        if (serverItems.isEmpty()) {
+            throw ErrorLoadingException("SERVER_ERR | data=$data | resp=${serverResp.take(200)}")
+        }
 
-                val sourceUrl = JSONObject(sourceJson).optJSONObject("result")?.optString("url", "")
-                if (!sourceUrl.isNullOrBlank()) {
-                    loadExtractor(sourceUrl, "$mainUrl/", subtitleCallback, callback)
+        var foundLinks = 0
+        val debugUrls = mutableListOf<String>()
+
+        serverItems.forEach { serverLi ->
+            val linkId = serverLi.attr("data-link-id")
+            val sourceResp = app.get(
+                "$mainUrl/ajax/sources?id=$linkId&asi=0&autoPlay=0",
+                headers = ajaxHeaders
+            ).text
+
+            val sourceUrl = if (sourceResp.trim().startsWith("{")) {
+                JSONObject(sourceResp).optJSONObject("result")?.optString("url", "")
+            } else {
+                ""
+            }
+
+            if (!sourceUrl.isNullOrBlank()) {
+                debugUrls.add(sourceUrl)
+                loadExtractor(sourceUrl, "$mainUrl/", subtitleCallback) { link ->
+                    foundLinks++
+                    callback.invoke(link)
                 }
+            } else {
+                debugUrls.add("EMPTY:${sourceResp.take(80)}")
             }
         }
+
+        if (foundLinks == 0) {
+            throw ErrorLoadingException("NO_EXTRACTOR | urls=${debugUrls.joinToString(" , ")}")
+        }
+
         return true
     }
 }
