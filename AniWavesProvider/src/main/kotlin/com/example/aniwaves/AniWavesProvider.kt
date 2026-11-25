@@ -1,11 +1,12 @@
 package com.example.aniwaves
 
 import com.lagradost.cloudstream3.*
-import com.lagradost.cloudstream3.network.WebViewResolver
 import com.lagradost.cloudstream3.utils.*
+import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Element
+import java.net.URI
 
 class AniWavesProvider : MainAPI() {
     override var mainUrl = "https://aniwaves.tv"
@@ -117,51 +118,84 @@ class AniWavesProvider : MainAPI() {
         if (serverHtml.isBlank()) return false
 
         val serverDoc = Jsoup.parse(serverHtml)
-        val resolver = WebViewResolver(Regex("""(\.m3u8|master\.txt|\.mp4)"""))
 
-        serverDoc.select("li[data-link-id]").forEach { serverLi ->
-            val linkId = serverLi.attr("data-link-id")
-            val serverName = serverLi.text().trim().ifBlank { "Server" }
-            val typeLabel = serverLi.closest(".type")?.attr("data-type")?.uppercase()?.ifBlank { "SUB" } ?: "SUB"
+        serverDoc.select("li[data-link-id]").apmap { serverLi ->
+            try {
+                val linkId = serverLi.attr("data-link-id")
+                val serverName = serverLi.text().trim().ifBlank { "Server" }
+                val typeLabel = serverLi.closest(".type")?.attr("data-type")?.uppercase()?.ifBlank { "SUB" } ?: "SUB"
 
-            val sourceResp = app.get(
-                "$mainUrl/ajax/sources?id=$linkId&asi=0&autoPlay=1",
-                headers = ajaxHeaders
-            ).text
+                val sourceResp = app.get(
+                    "$mainUrl/ajax/sources?id=$linkId&asi=0&autoPlay=1",
+                    headers = ajaxHeaders
+                ).text
 
-            val rawUrl = if (sourceResp.trim().startsWith("{")) {
-                JSONObject(sourceResp).optJSONObject("result")?.optString("url", "")
-            } else {
-                ""
-            }
-
-            if (!rawUrl.isNullOrBlank()) {
-                val embedUrl = if (rawUrl.contains("?")) "$rawUrl&autostart=true" else "$rawUrl?autostart=true"
-                val resolved = app.get(
-                    embedUrl,
-                    referer = "$mainUrl/",
-                    interceptor = resolver
-                )
-                val streamUrl = resolved.url
-                if (streamUrl.contains(".m3u8") || streamUrl.contains("master.txt")) {
-                    val embedOrigin = rawUrl.substringBefore("/embed") + "/"
-                    M3u8Helper.generateM3u8(
-                        source = "$name [$typeLabel - $serverName]",
-                        streamUrl = streamUrl,
-                        referer = embedOrigin
-                    ).forEach(callback)
-                } else if (streamUrl.contains(".mp4")) {
-                    callback.invoke(
-                        newExtractorLink(
-                            source = name,
-                            name = "$name [$typeLabel - $serverName]",
-                            url = streamUrl
-                        ) {
-                            this.referer = rawUrl
-                            this.quality = Qualities.Unknown.value
-                        }
-                    )
+                val rawUrl = if (sourceResp.trim().startsWith("{")) {
+                    JSONObject(sourceResp).optJSONObject("result")?.optString("url", "")
+                } else {
+                    ""
                 }
+
+                if (!rawUrl.isNullOrBlank()) {
+                    val cleanUrl = rawUrl.substringBefore("?")
+                    val baseUrl = cleanUrl.substringBeforeLast("/")
+                    val embedId = cleanUrl.substringAfterLast("/")
+                    val getSourcesUrl = "$baseUrl/getSources?id=$embedId"
+                    val embedOrigin = try {
+                        val uri = URI(cleanUrl)
+                        "${uri.scheme}://${uri.host}/"
+                    } catch (_: Exception) {
+                        "$mainUrl/"
+                    }
+
+                    val embedResp = app.get(
+                        getSourcesUrl,
+                        headers = commonHeaders + mapOf(
+                            "Referer" to rawUrl,
+                            "X-Requested-With" to "XMLHttpRequest"
+                        )
+                    ).text
+
+                    if (embedResp.trim().startsWith("{")) {
+                        val json = JSONObject(embedResp)
+
+                        // Extrage subtitrările (ignoră thumbnails)
+                        val tracks = json.optJSONArray("tracks")
+                        if (tracks != null) {
+                            for (i in 0 until tracks.length()) {
+                                val track = tracks.optJSONObject(i) ?: continue
+                                val kind = track.optString("kind", "")
+                                val file = track.optString("file", "")
+                                val label = track.optString("label", "English")
+                                if (file.isNotBlank() && kind != "thumbnails") {
+                                    subtitleCallback.invoke(SubtitleFile(label, file))
+                                }
+                            }
+                        }
+
+                        // Extrage stream-ul m3u8 (string simplu sau array)
+                        val streamUrls = mutableListOf<String>()
+                        when (val sourcesAny = json.opt("sources")) {
+                            is String -> if (sourcesAny.isNotBlank()) streamUrls.add(sourcesAny)
+                            is JSONArray -> {
+                                for (i in 0 until sourcesAny.length()) {
+                                    val file = sourcesAny.optJSONObject(i)?.optString("file", "")
+                                    if (!file.isNullOrBlank()) streamUrls.add(file)
+                                }
+                            }
+                        }
+
+                        streamUrls.forEach { m3u8Url ->
+                            M3u8Helper.generateM3u8(
+                                source = "$name [$typeLabel - $serverName]",
+                                streamUrl = m3u8Url,
+                                referer = embedOrigin
+                            ).forEach(callback)
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // Ignoră serverele care nu răspund ca să nu blocheze restul
             }
         }
         return true
