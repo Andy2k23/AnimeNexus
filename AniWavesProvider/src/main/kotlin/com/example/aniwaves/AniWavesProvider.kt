@@ -143,23 +143,27 @@ class AniWavesProvider : MainAPI() {
                     val getSourcesUrl = "$baseUrl/getSources?id=$embedId"
                     val embedOrigin = try {
                         val uri = URI(cleanUrl)
-                        "${uri.scheme}://${uri.host}/"
+                        "${uri.scheme}://${uri.host}"
                     } catch (_: Exception) {
-                        "$mainUrl/"
+                        mainUrl
                     }
+
+                    // Încarcă pagina de embed mai întâi pentru cookie-uri de sesiune
+                    val embedPage = app.get(rawUrl, headers = commonHeaders)
 
                     val embedResp = app.get(
                         getSourcesUrl,
                         headers = commonHeaders + mapOf(
                             "Referer" to rawUrl,
+                            "Origin" to embedOrigin,
                             "X-Requested-With" to "XMLHttpRequest"
-                        )
+                        ),
+                        cookies = embedPage.cookies
                     ).text
 
                     if (embedResp.trim().startsWith("{")) {
                         val json = JSONObject(embedResp)
 
-                        // Extrage subtitrările (ignoră thumbnails)
                         val tracks = json.optJSONArray("tracks")
                         if (tracks != null) {
                             for (i in 0 until tracks.length()) {
@@ -173,7 +177,6 @@ class AniWavesProvider : MainAPI() {
                             }
                         }
 
-                        // Extrage stream-ul m3u8 (string simplu sau array)
                         val streamUrls = mutableListOf<String>()
                         when (val sourcesAny = json.opt("sources")) {
                             is String -> if (sourcesAny.isNotBlank()) streamUrls.add(sourcesAny)
@@ -186,16 +189,36 @@ class AniWavesProvider : MainAPI() {
                         }
 
                         streamUrls.forEach { m3u8Url ->
-                            M3u8Helper.generateM3u8(
-                                source = "$name [$typeLabel - $serverName]",
-                                streamUrl = m3u8Url,
-                                referer = embedOrigin
-                            ).forEach(callback)
+                            val parsedLinks = try {
+                                M3u8Helper.generateM3u8(
+                                    source = "$name [$typeLabel - $serverName]",
+                                    streamUrl = m3u8Url,
+                                    referer = "$embedOrigin/"
+                                )
+                            } catch (_: Exception) {
+                                emptyList()
+                            }
+
+                            if (parsedLinks.isNotEmpty()) {
+                                parsedLinks.forEach(callback)
+                            } else {
+                                callback.invoke(
+                                    newExtractorLink(
+                                        source = name,
+                                        name = "$name [$typeLabel - $serverName]",
+                                        url = m3u8Url,
+                                        type = ExtractorLinkType.M3U8
+                                    ) {
+                                        this.referer = "$embedOrigin/"
+                                        this.quality = Qualities.Unknown.value
+                                    }
+                                )
+                            }
                         }
                     }
                 }
             } catch (_: Exception) {
-                // Ignoră serverele care nu răspund ca să nu blocheze restul
+                // Ignoră serverele care nu răspund
             }
         }
         return true
